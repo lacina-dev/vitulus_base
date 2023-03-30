@@ -1,12 +1,18 @@
 <launch>
+    <arg name="run_description" default="false"/>
+
+    <group if="$(arg run_description)">
+        <include file="$(find vitulus_description)/launch/vitulus4wd.launch">
+            <arg name="rviz" value="true"/>
+        </include>
+    </group>
 
 	<!-- Vitulus model -->
-	<param name="robot_description"
-    	   command="$(find xacro)/xacro '$(find vitulus_description)/urdf/vitulus4WD_description.urdf.xacro' --inorder" />
+	<param name="robot_description" command="$(find xacro)/xacro '$(find vitulus_description)/urdf/vitulus4WD_description.urdf.xacro' --inorder" />
 
-        <node name="vitulus_base_node" pkg="vitulus_base" type="vitulus_base_node">
-            <remap from="/mobile_base_controller/cmd_vel" to="/cmd_vel" />
-        </node>
+    <node name="vitulus_base_node" pkg="vitulus_base" type="vitulus_base_node">
+        <remap from="/mobile_base_controller/cmd_vel" to="/cmd_vel" />
+    </node>
 
     <!-- HW Controller -->
     <node pkg="vitulus_base" type="base_controller" name="base_controller" output="screen"/>
@@ -24,5 +30,6 @@
 <!--      <rosparam command="load" file="$(find vitulus_base)/config/ekf_config.yaml" />-->
 <!--      <remap from="/odometry/filtered" to="/odometry/filtered/local" />-->
 <!--    </node>-->
+
 
 </launch>
