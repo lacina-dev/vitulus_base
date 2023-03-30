@@ -1,6 +1,11 @@
 # Vitulus base
 Wheel ROS controller for VITULUS.
 
+it is necessary map USB port where is coneccted fdcanusb to /dev/fdcanusb before you run this controller.
+
+See VITULUS install guide for more info.
+TODO: add link.
+
 ## Node [/vitulus_base_node]
 
 
