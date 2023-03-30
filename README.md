@@ -5,7 +5,6 @@ Wheel ROS controller for VITULUS.
 
 
 Publications: 
-
  * /base/front_left_wheel_vel [std_msgs/Float32]
  * /base/front_right_wheel_vel [std_msgs/Float32]
  * /base/rear_left_wheel_vel [std_msgs/Float32]
@@ -18,9 +17,7 @@ Publications:
  * /rosout [rosgraph_msgs/Log]
  * /tf [tf/tfMessage]
 
-
 Subscriptions: 
-
  * /base/front_left_wheel_angle [std_msgs/Float32]
  * /base/front_left_wheel_real_vel [std_msgs/Float32]
  * /base/front_right_wheel_angle [std_msgs/Float32]
@@ -29,11 +26,9 @@ Subscriptions:
  * /base/rear_left_wheel_real_vel [std_msgs/Float32]
  * /base/rear_right_wheel_angle [std_msgs/Float32]
  * /base/rear_right_wheel_real_vel [std_msgs/Float32]
- * /cmd_vel [unknown type]
-
+ * /cmd_vel [geometry_msgs/Twist]
 
 Services: 
-
  * /controller_manager/list_controller_types
  * /controller_manager/list_controllers
  * /controller_manager/load_controller
@@ -45,5 +40,28 @@ Services:
  * /stop
  * /vitulus_base_node/get_loggers
  * /vitulus_base_node/set_logger_level
+
+
+## Install
+
+`cd ~/catkin_ws/src/vitulus`
+
+`git clone https://github.com/lacina-dev/vitulus_base.git`
+
+`cd ~/catkin_ws`
+
+`catkin build`
+
+## Run
+
+`roslaunch vitulus_base base_control.launch run_description:=true`
+
+## Info
+
+ More about VITULUS? See my website.
+ [https://lacina.dev](https://lacina.dev)
+
+ Questions? Try Discord.
+ [Discord channel](https://discord.gg/YqeNV5hEVN)
 
  
