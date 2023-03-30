@@ -1,4 +1,5 @@
 # Vitulus base
+Wheel ROS controller for VITULUS.
 
 ## Node [/vitulus_base_node]
 
