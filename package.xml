@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>vitulus_base</name>
+  <version>0.0.1</version>
+  <description>Vitulus motor controller.</description>
+
+  <maintainer email="robert@lacina.dev">Robert Lacina</maintainer>
+  <license>MIT</license>
+  <author email="robert@lacina.dev">Robert Lacina</author>
+
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>rospy</depend>
+  <depend>roscpp</depend>
+  <depend>std_msgs</depend>
+  <exec_depend>rosserial_python</exec_depend>
+  <exec_depend>message_runtime</exec_depend>
+  <build_depend>message_generation</build_depend>
+  <build_depend>controller_manager</build_depend>
+  <build_depend>roslaunch</build_depend>
+  <build_depend>hardware_interface</build_depend>
+  <build_depend>trajectory_msgs</build_depend>
+
+
+  <exec_depend>controller_manager</exec_depend>
+<!--  <exec_depend>roscpp</exec_depend>-->
+  <exec_depend>hardware_interface</exec_depend>
+  <exec_depend>effort_controllers</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>diff_drive_controller</exec_depend>
+</package>
+

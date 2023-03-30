@@ -1,0 +1,506 @@
+#!/usr/bin/python3
+
+"""
+### RUN motor config
+python3 -m moteus.moteus_tool --target 1 --calibrate
+
+### RUN moteus gui
+python3 -m moteus_gui.tview --devices=1
+
+#############   my test commands
+conf set id.id 2 # change number for id 1,2,3,4
+conf set servopos.position_min nan
+conf set servopos.position_max nan
+conf set servo.max_velocity 125.000000
+conf set servo.max_position_slip 0.2
+conf set motor.unwrapped_position_scale 0.076923077 ### nepouzito
+conf set servo.flux_brake_min_voltage 26.0
+conf set servo.default_timeout_s 0.7
+### NOW --- reconnect tview and then can save new id
+conf write
+
+### move
+d pos nan 7 2 d2
+d pos nan 10 1 d1 p1
+d stop
+
+"""
+
+
+
+import time
+import rospy
+import asyncio
+import math
+import moteus
+import threading
+from geometry_msgs.msg import Twist
+import sys
+import signal
+from std_msgs.msg import String
+from std_msgs.msg import Float32, Bool
+from vitulus_base.msg import vitulus_controller_state
+from vitulus_ups.msg import power_status
+
+
+class RobotSpec:
+    FRONT_LEFT_ID = 1
+    FRONT_RIGHT_ID = 2
+    REAR_LEFT_ID = 3
+    REAR_RIGHT_ID = 4
+    REDUCER = 13
+    WHEEL_DIA = 0.21  # meters
+    ROTATION_DISTANCE = (WHEEL_DIA * math.pi) / REDUCER
+    METER_ROTATION = 1 / ROTATION_DISTANCE
+    MOT_RPS_TO_WHEEL_RAD = (2 * math.pi) / REDUCER
+    WHEEL_RAD_TO_MOT_RPS = REDUCER / (2 * math.pi)
+    TORQUE = 0.7  # Nm
+    torque_recent = TORQUE
+    reset = False
+
+
+class ControllerState:
+    def __init__(self, id):
+        # 2 / {MODE(0x000): 3, POSITION(0x001): 0.0790252685546875,
+        #      VELOCITY(0x002): 0.07530862092971802, TORQUE(0x003): 0.0, VOLTAGE(0x00d): 23.5,
+        #      TEMPERATURE(0x00e): 29.0, FAULT(0x00f): 0}
+        self.id = id
+        self.mode = 0
+        self.position = 0
+        self.velocity = 0
+        self.torque = 0
+        self.voltage = 0
+        self.temperature = 0
+        self.fault = 0
+        self.position_offset_dist = 0
+        self.position_offset_ang = 0
+        self.position_ang = 0
+        self.position_distance = 0
+        self.velocity_ang = 0
+        self.velocity_distance = 0
+
+    def set_values(self, state):
+        self.mode = state.values[moteus.Register.MODE]
+        self.position = (state.values[moteus.Register.POSITION] * RobotSpec.ROTATION_DISTANCE) - self.position_offset_dist
+        self.velocity = state.values[moteus.Register.VELOCITY]
+        self.torque = state.values[moteus.Register.TORQUE]
+        self.voltage = state.values[moteus.Register.VOLTAGE]
+        self.temperature = state.values[moteus.Register.TEMPERATURE]
+        self.fault = state.values[moteus.Register.FAULT]
+        self.position_ang = (state.values[moteus.Register.POSITION] * RobotSpec.MOT_RPS_TO_WHEEL_RAD) - self.position_offset_ang
+        self.position_distance = (state.values[moteus.Register.POSITION] * RobotSpec.ROTATION_DISTANCE) - self.position_offset_dist
+        self.velocity_ang = (state.values[moteus.Register.VELOCITY] * RobotSpec.MOT_RPS_TO_WHEEL_RAD) - self.position_offset_ang
+        self.velocity_distance = (state.values[moteus.Register.VELOCITY] * RobotSpec.ROTATION_DISTANCE) - self.position_offset_dist
+
+    def set_offset(self, state):
+        self.position_offset_dist = (state.values[moteus.Register.POSITION] * RobotSpec.ROTATION_DISTANCE)
+        self.position_offset_ang = (state.values[moteus.Register.POSITION] * RobotSpec.MOT_RPS_TO_WHEEL_RAD)
+        print("############################## {}".format(self.position_offset_dist))
+
+
+class MotorController:
+    def __init__(self, id_nr):
+        self.id = id_nr
+        self.c = moteus.Controller(self.id)
+        self.state = ControllerState(self.id)
+        self.velocity = 0
+        # self.set_offset()
+
+
+
+
+
+
+
+class BaseController:
+    def __init__(self):
+        self.c_front_left = MotorController(RobotSpec.FRONT_LEFT_ID)
+        self.c_front_right = MotorController(RobotSpec.FRONT_RIGHT_ID)
+        self.c_rear_left = MotorController(RobotSpec.REAR_LEFT_ID)
+        self.c_rear_right = MotorController(RobotSpec.REAR_RIGHT_ID)
+
+
+        # This will be updated by the ROS thread in the background.
+        # The lock must be held when reading or writing it.
+        self.lock = threading.Lock()
+        self.current_request = None
+        self.motors_switch = False
+        self.motors_power_switch = None
+        self.motors_switch_pub = None
+
+    async def run(self):
+        # Here, we first stop the controller, then repeatedly send
+        # whatever target angle we most recently received from the ROS
+        # subscription.
+        await self.c_front_left.c.set_stop()
+        await self.c_front_right.c.set_stop()
+        await self.c_rear_left.c.set_stop()
+        await self.c_rear_right.c.set_stop()
+        time.sleep(1)
+        state_front_left = await self.c_front_left.c.query()
+        state_front_right = await self.c_front_right.c.query()
+        state_rear_left = await self.c_rear_left.c.query()
+        state_rear_right = await self.c_rear_right.c.query()
+        self.c_front_left.state.set_offset(state_front_left)
+        self.c_front_right.state.set_offset(state_front_right)
+        self.c_rear_left.state.set_offset(state_rear_left)
+        self.c_rear_right.state.set_offset(state_rear_right)
+
+        while True:
+            with self.lock:
+                if RobotSpec.reset:
+                    await self.c_front_left.c.set_stop()
+                    await self.c_front_right.c.set_stop()
+                    await self.c_rear_left.c.set_stop()
+                    await self.c_rear_right.c.set_stop()
+                    RobotSpec.reset = False
+
+
+                state_front_left = await self.c_front_left.c.set_position(
+                    position=math.nan,
+                    velocity=self.c_front_left.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS * -1,
+                    feedforward_torque=-0.1,
+                    kp_scale=0.7,
+                    kd_scale=1,
+                    maximum_torque=RobotSpec.torque_recent,
+                    stop_position=None,
+                    watchdog_timeout=None,
+                    # velocity_limit=125,
+                    # accel_limit=0.01,
+                    query=True)
+
+                state_front_right = await self.c_front_right.c.set_position(
+                    position=math.nan,
+                    velocity=self.c_front_right.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS,
+                    feedforward_torque=-0.1,
+                    kp_scale=0.7,
+                    kd_scale=1,
+                    maximum_torque=RobotSpec.torque_recent,
+                    stop_position=None,
+                    watchdog_timeout=None,
+                    # velocity_limit=125,
+                    # accel_limit=0.01,
+                    query=True)
+
+                state_rear_left = await self.c_rear_left.c.set_position(
+                    position=math.nan,
+                    velocity=self.c_rear_left.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS * -1,
+                    feedforward_torque=-0.1,
+                    kp_scale=0.7,
+                    kd_scale=1,
+                    maximum_torque=RobotSpec.torque_recent,
+                    stop_position=None,
+                    watchdog_timeout=None,
+                    # velocity_limit=125,
+                    # accel_limit=0.01,
+                    query=True)
+
+                state_rear_right = await self.c_rear_right.c.set_position(
+                    position=math.nan,
+                    velocity=self.c_rear_right.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS,
+                    feedforward_torque=-0.1,
+                    kp_scale=0.7,
+                    kd_scale=1,
+                    maximum_torque=RobotSpec.torque_recent,
+                    stop_position=None,
+                    watchdog_timeout=None,
+                    # velocity_limit=125,
+                    # accel_limit=0.01,
+                    query=True)
+
+                # else:
+                state_front_left = await self.c_front_left.c.query()
+                state_front_right = await self.c_front_right.c.query()
+                state_rear_left = await self.c_rear_left.c.query()
+                state_rear_right= await self.c_rear_right.c.query()
+                self.c_front_left.state.set_values(state_front_left)
+                self.c_front_right.state.set_values(state_front_right)
+                self.c_rear_left.state.set_values(state_rear_left)
+                self.c_rear_right.state.set_values(state_rear_right)
+
+
+
+            await asyncio.sleep(0.02)
+
+
+    def callback_motor_power(self, msg):
+        with self.lock:
+            if msg.data:
+                RobotSpec.torque_recent = RobotSpec.TORQUE
+                RobotSpec.reset = True
+
+            else:
+                RobotSpec.torque_recent = 0
+
+    def callback_set_torque(self, msg):
+        with self.lock:
+                RobotSpec.torque_recent = msg.data / RobotSpec.REDUCER
+                RobotSpec.TORQUE = msg.data / RobotSpec.REDUCER
+
+
+
+
+    def callback_front_left_vel(self, msg):
+        with self.lock:
+            self.c_front_left.velocity = msg.data
+
+    def callback_front_right_vel(self, msg):
+        with self.lock:
+            self.c_front_right.velocity = msg.data
+
+    def callback_rear_left_vel(self, msg):
+        with self.lock:
+            self.c_rear_left.velocity = msg.data
+
+    def callback_rear_right_vel(self, msg):
+        with self.lock:
+            self.c_rear_right.velocity = msg.data
+
+    def callback_power_status(self, msg):
+        self.motors_switch = msg.motor_out_switch
+
+async def main():
+    controller = BaseController()
+
+    # Start ROS in a thread separate from the asyncio one.
+    def start_ros():
+        # Publisher to motor switch on the power module and subscriber for motor switch check.
+        # global motors_power_switch
+        controller.motors_switch_pub = rospy.Publisher("/set_motor_switch", Bool, queue_size=10)
+        controller.motors_power_switch = rospy.Subscriber('/power_status', power_status, controller.callback_power_status)
+
+
+        # threading.Thread(target=lambda: rospy.init_node('single_motor', disable_signals=True)).start()
+        pub_front_left_angle = rospy.Publisher("/base/front_left_wheel_angle", Float32, queue_size=10)
+        pub_front_right_angle = rospy.Publisher("/base/front_right_wheel_angle", Float32, queue_size=10)
+        pub_rear_left_angle = rospy.Publisher("/base/rear_left_wheel_angle", Float32, queue_size=10)
+        pub_rear_right_angle = rospy.Publisher("/base/rear_right_wheel_angle", Float32, queue_size=10)
+
+        pub_front_left_velocity = rospy.Publisher("/base/front_left_wheel_real_vel", Float32, queue_size=10)
+        pub_front_right_velocity = rospy.Publisher("/base/front_right_wheel_real_vel", Float32, queue_size=10)
+        pub_rear_left_velocity = rospy.Publisher("/base/rear_left_wheel_real_vel", Float32, queue_size=10)
+        pub_rear_right_velocity = rospy.Publisher("/base/rear_right_wheel_real_vel", Float32, queue_size=10)
+
+        pub_front_left_state = rospy.Publisher("/base/front_left_wheel_state", vitulus_controller_state, queue_size=10)
+        pub_front_right_state = rospy.Publisher("/base/front_right_wheel_state", vitulus_controller_state, queue_size=10)
+        pub_rear_left_state = rospy.Publisher("/base/rear_left_wheel_state", vitulus_controller_state, queue_size=10)
+        pub_rear_right_state = rospy.Publisher("/base/rear_right_wheel_state", vitulus_controller_state, queue_size=10)
+
+        rospy.init_node('base_controller', disable_signals=True)
+        # rospy.Subscriber('/cmd_vel', Twist, controller.ROS_handle_request)
+        rospy.Subscriber('/base/front_left_wheel_vel', Float32, controller.callback_front_left_vel)
+        rospy.Subscriber('/base/front_right_wheel_vel', Float32, controller.callback_front_right_vel)
+        rospy.Subscriber('/base/rear_left_wheel_vel', Float32, controller.callback_rear_left_vel)
+        rospy.Subscriber('/base/rear_right_wheel_vel', Float32, controller.callback_rear_right_vel)
+
+
+        rospy.Subscriber('/base/motor_power', Bool, controller.callback_motor_power)
+        pub_motor_power_state = rospy.Publisher("/base/motor_power_state", Bool, queue_size=10)
+
+        rospy.Subscriber('/base/set_torque', Float32, controller.callback_set_torque)
+        pub_get_torque_set = rospy.Publisher("/base/get_torque_set", Float32, queue_size=10)
+
+        # This will loop the ROS thread forever.
+        # rospy.spin()
+        r = rospy.Rate(50)  # Hz
+
+        first_run = True
+        while not rospy.is_shutdown():
+
+            # Turn on power switch on the power module.
+            if first_run:
+                new_msg = Bool()
+                new_msg.data = True
+                controller.motors_switch_pub.publish(new_msg)
+                if (controller.motors_switch):
+                    first_run = False
+
+            new_msg = Float32()
+            new_msg.data = controller.c_front_left.state.position_ang * -1
+            pub_front_left_angle.publish(new_msg)
+            # print(new_msg.data)
+
+            new_msg = Float32()
+            new_msg.data = controller.c_front_right.state.position_ang
+            pub_front_right_angle.publish(new_msg)
+
+            new_msg = Float32()
+            new_msg.data = controller.c_rear_left.state.position_ang * -1
+            pub_rear_left_angle.publish(new_msg)
+
+            new_msg = Float32()
+            new_msg.data = controller.c_rear_right.state.position_ang
+            pub_rear_right_angle.publish(new_msg)
+
+#########################
+            new_msg = Float32()
+            new_msg.data = controller.c_front_left.state.velocity_ang * -1
+            pub_front_left_velocity.publish(new_msg)
+
+            new_msg = Float32()
+            new_msg.data = controller.c_front_right.state.velocity_ang
+            pub_front_right_velocity.publish(new_msg)
+
+            new_msg = Float32()
+            new_msg.data = controller.c_rear_left.state.velocity_ang * -1
+            pub_rear_left_velocity.publish(new_msg)
+
+            new_msg = Float32()
+            new_msg.data = controller.c_rear_right.state.velocity_ang
+            pub_rear_right_velocity.publish(new_msg)
+
+
+#############################
+
+            def get_mode(code):
+                if code == 0:
+                    return "STOPPED"
+                elif code == 1:
+                    return "FAULT"
+                elif code == 5:
+                    return "PWM"
+                elif code == 6:
+                    return "VOLTAGE"
+                elif code == 7:
+                    return "VOLTAGE_FOC"
+                elif code == 8:
+                    return "VOLTAGE_DQ"
+                elif code == 9:
+                    return "CURRENT"
+                elif code == 10:
+                    return "POSITION"
+                elif code == 11:
+                    return "TIMEOUT"
+                elif code == 12:
+                    return "ZERO_VELOCITY"
+                elif code == 13:
+                    return "STAY_WITHIN"
+                else:
+                    return str(code)
+
+            def get_fault(code):
+                if code == 0:
+                    return "OK"
+                elif code == 32:
+                    return "CALIBRATION_FAULT"
+                elif code == 33:
+                    return "MOTOR_DRV_FAULT"
+                elif code == 34:
+                    return "OVER_VOLTAGE"
+                elif code == 35:
+                    return "ENCODER_FAULT"
+                elif code == 36:
+                    return "MOTOR_NOT_CONFG"
+                elif code == 37:
+                    return "PWM_CYCLE_OVERRUN"
+                elif code == 38:
+                    return "OVER_TEMP"
+                elif code == 39:
+                    return "OUTSIDE_LIMIT"
+                else:
+                    return str(code)
+
+
+
+            new_msg = vitulus_controller_state()
+            new_msg.name = "FRONT_LEFT"
+            new_msg.id = controller.c_front_left.state.id
+            new_msg.mode = get_mode(controller.c_front_left.state.mode)
+            new_msg.position = controller.c_front_left.state.position * -1
+            new_msg.velocity = controller.c_front_left.state.velocity * RobotSpec.ROTATION_DISTANCE * -1
+            new_msg.torque = controller.c_front_left.state.torque * RobotSpec.REDUCER * -1
+            new_msg.voltage = controller.c_front_left.state.voltage
+            new_msg.temperature = controller.c_front_left.state.temperature
+            new_msg.fault = get_fault(controller.c_front_left.state.fault)
+            pub_front_left_state.publish(new_msg)
+
+            new_msg = vitulus_controller_state()
+            new_msg.name = "FRONT_RIGHT"
+            new_msg.id = controller.c_front_right.state.id
+            new_msg.mode = get_mode(controller.c_front_right.state.mode)
+            new_msg.position = controller.c_front_right.state.position * 1
+            new_msg.velocity = controller.c_front_right.state.velocity * RobotSpec.ROTATION_DISTANCE * 1
+            new_msg.torque = controller.c_front_right.state.torque * RobotSpec.REDUCER * 1
+            new_msg.voltage = controller.c_front_right.state.voltage
+            new_msg.temperature = controller.c_front_right.state.temperature
+            new_msg.fault = get_fault(controller.c_front_right.state.fault)
+            pub_front_right_state.publish(new_msg)
+
+            new_msg = vitulus_controller_state()
+            new_msg.name = "REAR_LEFT"
+            new_msg.id = controller.c_rear_left.state.id
+            new_msg.mode = get_mode(controller.c_rear_left.state.mode)
+            new_msg.position = controller.c_rear_left.state.position * -1
+            new_msg.velocity = controller.c_rear_left.state.velocity * RobotSpec.ROTATION_DISTANCE * -1
+            new_msg.torque = controller.c_rear_left.state.torque * RobotSpec.REDUCER * -1
+            new_msg.voltage = controller.c_rear_left.state.voltage
+            new_msg.temperature = controller.c_rear_left.state.temperature
+            new_msg.fault = get_fault(controller.c_rear_left.state.fault)
+            pub_rear_left_state.publish(new_msg)
+
+            new_msg = vitulus_controller_state()
+            new_msg.name = "REAR_RIGHT"
+            new_msg.id = controller.c_rear_right.state.id
+            new_msg.mode = get_mode(controller.c_rear_right.state.mode)
+            new_msg.position = controller.c_rear_right.state.position * 1
+            new_msg.velocity = controller.c_rear_right.state.velocity * RobotSpec.ROTATION_DISTANCE * 1
+            new_msg.torque = controller.c_rear_right.state.torque * RobotSpec.REDUCER * 1
+            new_msg.voltage = controller.c_rear_right.state.voltage
+            new_msg.temperature = controller.c_rear_right.state.temperature
+            new_msg.fault = get_fault(controller.c_rear_right.state.fault)
+            pub_rear_right_state.publish(new_msg)
+
+#######################################################
+            new_msg = Bool()
+            if (RobotSpec.torque_recent == 0.0 or
+                    controller.c_front_left.state.fault != 0 or
+                    controller.c_front_right.state.fault != 0 or
+                    controller.c_rear_left.state.fault != 0 or
+                    controller.c_rear_right.state.fault != 0 or
+                    controller.c_front_left.state.mode != 10 or
+                    controller.c_front_right.state.mode != 10 or
+                    controller.c_rear_left.state.mode != 10 or
+                    controller.c_rear_right.state.mode != 10):
+                new_msg.data = False
+            else:
+                new_msg.data = True
+            pub_motor_power_state.publish(new_msg)
+
+            new_msg = Float32()
+            new_msg.data = RobotSpec.torque_recent * RobotSpec.REDUCER
+            pub_get_torque_set.publish(new_msg)
+
+            # print("{} {} {} ".format(
+            #     # controller.c_front_left.state.velocity_ang,
+            #     # controller.c_front_left.state.velocity,
+            #     # controller.c_rear_left.state.velocity_distance,
+            #     # controller.c_rear_left.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS,
+            #     controller.c_front_left.state.position,
+            #     controller.c_front_left.state.position_distance,
+            #     controller.c_rear_left.state.position_ang
+            # ))
+
+            r.sleep()
+
+
+
+
+    ros_thread = threading.Thread(target=start_ros)
+    ros_thread.start()
+
+    def signal_handler(signal, frame):
+        new_msg = Bool()
+        new_msg.data = False
+        # global motors_power_switch
+        controller.motors_power_switch.publish(new_msg)
+        rospy.signal_shutdown("end")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    # Now run the asyncio portion.
+    await controller.run()
+
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

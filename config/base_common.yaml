@@ -1,0 +1,98 @@
+
+joint_state_controller:
+    type: joint_state_controller/JointStateController
+    publish_rate: 50
+
+mobile_base_controller:
+  type        : "diff_drive_controller/DiffDriveController"
+  left_wheel  : ['wheel_0_joint', 'wheel_2_joint']
+  right_wheel : ['wheel_1_joint', 'wheel_3_joint']
+  publish_rate: 50.0  # default: 50
+  pose_covariance_diagonal : [0.001, 0.001, 1000000.0, 1000000.0, 1000000.0, 1000.0]
+  twist_covariance_diagonal: [0.001, 0.001, 1000000.0, 1000000.0, 1000000.0, 1000.0]
+
+  # Wheel separation and diameter. These are both optional.
+  # diff_drive_controller will attempt to read either one or both from the
+  # URDF if not specified as a parameter
+#  wheel_separation : 0.472 # meters
+  wheel_radius : 0.1025
+  # Wheel separation and radius multipliers
+  wheel_separation_multiplier: 1.3 # default: 1.0
+  wheel_radius_multiplier    : 1.0 # default: 1.0
+
+  # Velocity commands timeout [s], default 0.5
+  cmd_vel_timeout: 0.25
+
+  # Base frame_id
+  base_frame_id: base_link #default: base_link
+
+  # Velocity and acceleration limits
+  # Whenever a min_* is unspecified, default to -max_*
+#  linear:
+#    x:
+#      has_velocity_limits    : true
+#      max_velocity           : 0.5 #1.0  # m/s 0.75
+#      min_velocity           : -0.5 #-0.5 # m/s -0.75
+#      has_acceleration_limits: true
+#      max_acceleration       : 1.0 #0.8  # m/s^2 1.8
+#      min_acceleration       : -1.0 #-0.4 # m/s^2 -1.8
+#      has_jerk_limits        : true
+#      max_jerk               : 40  # m/s^3
+#  angular:
+#    z:
+#      has_velocity_limits    : true
+#      max_velocity           : 0.5 #1.7  # rad/s 0.75
+#      has_acceleration_limits: true
+#      max_acceleration       : 1.2  # rad/s^2 2.0
+#      has_jerk_limits        : true
+#      max_jerk               : 30  # rad/s^3
+
+  linear:
+    x:
+      has_velocity_limits    : true
+      max_velocity           : 0.75 #1.0  # m/s 0.75
+      min_velocity           : -0.75 #-0.5 # m/s -0.75
+      has_acceleration_limits: true
+      max_acceleration       : 1.5 #0.8  # m/s^2 1.8
+      min_acceleration       : -1.5 #-0.4 # m/s^2 -1.8
+      has_jerk_limits        : true
+      max_jerk               : 50  # m/s^3
+  angular:
+    z:
+      has_velocity_limits    : true
+      max_velocity           : 0.75 #1.7  # rad/s 0.75
+      has_acceleration_limits: true
+      max_acceleration       : 2.0  # rad/s^2 2.0
+      has_jerk_limits        : true
+      max_jerk               : 40  # rad/s^3
+
+
+#  linear:
+#    x:
+#      has_velocity_limits: true
+#      max_velocity: 2.0 #1.0  # m/s 0.75
+#      min_velocity: -2.0 #-0.5 # m/s -0.75
+#      has_acceleration_limits: true
+#      max_acceleration: 3.0 #0.8  # m/s^2 1.8
+#      min_acceleration: -3.0 #-0.4 # m/s^2 -1.8
+#      has_jerk_limits: true
+#      max_jerk: 80  # m/s^3
+#  angular:
+#    z:
+#      has_velocity_limits: true
+#      max_velocity: 3.5 #1.7  # rad/s 0.75
+#      has_acceleration_limits: true
+#      max_acceleration: 5.0  # rad/s^2 2.0
+#      has_jerk_limits: true
+#      max_jerk: 60  # rad/s^3
+
+
+  #Publish to TF directly or not
+  enable_odom_tf: false
+
+  #Name of frame to publish odometry in
+  odom_frame_id: odom
+
+  # Publish the velocity command to be executed.
+  # It is to monitor the effect of limiters on the controller input.
+  publish_cmd: true
