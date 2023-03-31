@@ -1,10 +1,8 @@
 # Vitulus base
-Wheel ROS controller for VITULUS.
+Wheel ROS controller for VITULUS. It is a driver for moteus controllers.
 
 it is necessary to map the USB port where fdcanusb is connected to /dev/fdcanusb before you run this controller.
 
-See VITULUS install guide for more info.
-TODO: add link.
 
 ## Node [/vitulus_base_node]
 
@@ -62,6 +60,9 @@ Services:
 `roslaunch vitulus_base base_control.launch run_description:=true`
 
 ## Info
+
+ More details.
+ [Motor assembly and controllers connection](https://docs.google.com/document/d/1Q6g1YeftRPKx67mn_4nCeVRBswe78MrCWejogsvNu1s/edit?usp=sharing)
 
  More about VITULUS? See my website.
  [https://lacina.dev](https://lacina.dev)
