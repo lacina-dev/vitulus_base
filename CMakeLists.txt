@@ -1,7 +1,7 @@
 ################################################################################
 # Set minimum required version of cmake, project name and compile options
 ################################################################################
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.0.2)
 project(vitulus_base)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
@@ -29,15 +29,7 @@ catkin_python_setup()
 ################################################################################
 # Declare ROS messages, services and actions
 ################################################################################
-add_message_files(
-  FILES
-  vitulus_controller_state.msg
-)
 
-generate_messages(
-  DEPENDENCIES
-  std_msgs
-)
 ################################################################################
 # Declare ROS dynamic reconfigure parameters
 ################################################################################

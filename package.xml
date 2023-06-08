@@ -15,11 +15,15 @@
   <depend>std_msgs</depend>
   <exec_depend>rosserial_python</exec_depend>
   <exec_depend>message_runtime</exec_depend>
+  <exec_depend>vitulus_msgs</exec_depend>
+  <exec_depend>vitulus_ups</exec_depend>
   <build_depend>message_generation</build_depend>
   <build_depend>controller_manager</build_depend>
   <build_depend>roslaunch</build_depend>
   <build_depend>hardware_interface</build_depend>
   <build_depend>trajectory_msgs</build_depend>
+  <build_depend>vitulus_msgs</build_depend>
+  <build_depend>vitulus_ups</build_depend>
 
 
   <exec_depend>controller_manager</exec_depend>
