@@ -14,8 +14,6 @@
         <remap from="/mobile_base_controller/cmd_vel" to="/cmd_vel" />
     </node>
 
-    <!-- HW Controller -->
-    <node pkg="vitulus_base" type="base_controller" name="base_controller" output="screen" respawn="true"/>
 
 
     <!-- Controller -->
@@ -24,5 +22,9 @@
     <node name="controller_spawner" pkg="controller_manager" type="spawner" output="screen"
           args="joint_state_controller
           mobile_base_controller"/>
+
+    <!-- HW Controller -->
+    <node pkg="vitulus_base" type="base_controller" name="base_controller" output="screen" respawn="true"/>
+
 
 </launch>
