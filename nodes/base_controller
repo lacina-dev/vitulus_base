@@ -15,8 +15,12 @@ conf set servo.max_velocity 125.000000
 conf set servo.max_position_slip 0.2
 conf set servo.flux_brake_min_voltage 26.0
 conf set servo.default_timeout_s 0.7
+conf set servo.pwm_rate_hz 15000
+conf set servo.derate_temperature 60
+
 ### NOW --- reconnect tview and then can save new id
 conf write
+
 
 ### move
 d pos nan 7 2 d2
@@ -322,7 +326,7 @@ class BaseController:
                     kd_scale=1,
                     maximum_torque=torq,
                     stop_position=None,
-                    watchdog_timeout=None,
+                    watchdog_timeout=0.5,
                     # velocity_limit=125,
                     # accel_limit=0.01,
                     query=False)
@@ -344,7 +348,7 @@ class BaseController:
                     kd_scale=1,
                     maximum_torque=torq,
                     stop_position=None,
-                    watchdog_timeout=None,
+                    watchdog_timeout=0.5,
                     # velocity_limit=125,
                     # accel_limit=0.01,
                     query=False)
@@ -367,7 +371,7 @@ class BaseController:
                     kd_scale=1,
                     maximum_torque=torq,
                     stop_position=None,
-                    watchdog_timeout=None,
+                    watchdog_timeout=0.5,
                     # velocity_limit=125,
                     # accel_limit=0.01,
                     query=False)
@@ -389,7 +393,7 @@ class BaseController:
                     kd_scale=1,
                     maximum_torque=torq,
                     stop_position=None,
-                    watchdog_timeout=None,
+                    watchdog_timeout=0.5,
                     # velocity_limit=125,
                     # accel_limit=0.01,
                     query=False)

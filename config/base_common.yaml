@@ -47,11 +47,30 @@ mobile_base_controller:
 #      has_jerk_limits        : true
 #      max_jerk               : 30  # rad/s^3
 
+#  linear:
+#    x:
+#      has_velocity_limits    : true
+#      max_velocity           : 0.75 #1.0  # m/s 0.75
+#      min_velocity           : -0.75 #-0.5 # m/s -0.75
+#      has_acceleration_limits: true
+#      max_acceleration       : 1.5 #0.8  # m/s^2 1.8
+#      min_acceleration       : -1.5 #-0.4 # m/s^2 -1.8
+#      has_jerk_limits        : true
+#      max_jerk               : 50  # m/s^3
+#  angular:
+#    z:
+#      has_velocity_limits    : true
+#      max_velocity           : 0.75 #1.7  # rad/s 0.75
+#      has_acceleration_limits: true
+#      max_acceleration       : 2.0  # rad/s^2 2.0
+#      has_jerk_limits        : true
+#      max_jerk               : 40  # rad/s^3
+
   linear:
     x:
       has_velocity_limits    : true
-      max_velocity           : 0.75 #1.0  # m/s 0.75
-      min_velocity           : -0.75 #-0.5 # m/s -0.75
+      max_velocity           : 1.4 #1.0  # m/s 0.75
+      min_velocity           : -1.4 #-0.5 # m/s -0.75
       has_acceleration_limits: true
       max_acceleration       : 1.5 #0.8  # m/s^2 1.8
       min_acceleration       : -1.5 #-0.4 # m/s^2 -1.8
@@ -60,11 +79,13 @@ mobile_base_controller:
   angular:
     z:
       has_velocity_limits    : true
-      max_velocity           : 0.75 #1.7  # rad/s 0.75
+      max_velocity           : 1.75 #1.7  # rad/s 0.75
       has_acceleration_limits: true
       max_acceleration       : 2.0  # rad/s^2 2.0
       has_jerk_limits        : true
       max_jerk               : 40  # rad/s^3
+
+
 
 
 #  linear:
