@@ -53,7 +53,7 @@ class RobotSpec:
     METER_ROTATION = 1 / ROTATION_DISTANCE
     MOT_RPS_TO_WHEEL_RAD = (2 * math.pi) / REDUCER
     WHEEL_RAD_TO_MOT_RPS = REDUCER / (2 * math.pi)
-    TORQUE = 0.7  # Nm
+    TORQUE = 1.538461538  # Nm on motor
     torque_recent = TORQUE
     reset_controller = False
     reset_rospy = False
@@ -322,7 +322,7 @@ class BaseController:
                     position=math.nan,
                     velocity=vel,
                     feedforward_torque=-0.1,
-                    kp_scale=0.7,
+                    kp_scale=2,
                     kd_scale=1,
                     maximum_torque=torq,
                     stop_position=None,
@@ -344,7 +344,7 @@ class BaseController:
                     position=math.nan,
                     velocity=vel,
                     feedforward_torque=-0.1,
-                    kp_scale=0.7,
+                    kp_scale=2,
                     kd_scale=1,
                     maximum_torque=torq,
                     stop_position=None,
@@ -367,7 +367,7 @@ class BaseController:
                     position=math.nan,
                     velocity=vel,
                     feedforward_torque=-0.1,
-                    kp_scale=0.7,
+                    kp_scale=2,
                     kd_scale=1,
                     maximum_torque=torq,
                     stop_position=None,
@@ -389,7 +389,7 @@ class BaseController:
                     position=math.nan,
                     velocity=vel,
                     feedforward_torque=-0.1,
-                    kp_scale=0.7,
+                    kp_scale=2,
                     kd_scale=1,
                     maximum_torque=torq,
                     stop_position=None,
