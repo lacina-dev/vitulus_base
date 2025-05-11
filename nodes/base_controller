@@ -16,7 +16,7 @@ conf set servopos.position_max nan
 conf set servo.max_velocity 125.000000
 conf set servo.max_position_slip 0.2
 conf set servo.flux_brake_min_voltage 26.0
-conf set servo.default_timeout_s 0.7
+conf set servo.default_timeout_s nan
 conf set servo.pwm_rate_hz 15000
 conf set servo.derate_temperature 60
 conf write
