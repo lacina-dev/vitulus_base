@@ -7,7 +7,7 @@ python3 -m moteus.moteus_tool --target 1 --calibrate
 ### RUN moteus gui
 python3 -m moteus_gui.tview --devices=1
 
-#############   my test commands
+#############   commands
 conf set id.id 2 # change number for id 1,2,3,4
 conf write
 ### NOW --- reconnect tview with new id
@@ -23,8 +23,8 @@ conf write
 
 
 ### move for test
-d pos nan 7 2 d2
-d pos nan 10 1 d1 p1
+d pos nan 7 2 
+d pos nan 10 1 
 d stop
 
 """
@@ -55,25 +55,43 @@ class RobotSpec:
     WHEEL_RAD_TO_MOT_RPS = REDUCER / (2 * math.pi)
     TORQUE = 1.538461538  # Nm on motor
     torque_recent = TORQUE
-    reset_controller = False
-    reset_rospy = False
-    restart_controller = False
 
 
 class ControllerState:
+    # Mode Constants
+    MODE_STOPPED = 0
+    MODE_FAULT = 1
+    MODE_PWM = 5
+    MODE_VOLTAGE = 6
+    MODE_VOLTAGE_FOC = 7
+    MODE_VOLTAGE_DQ = 8
+    MODE_CURRENT = 9
+    MODE_POSITION = 10  # Assumed to be the normal operational mode
+    MODE_TIMEOUT = 11
+    MODE_ZERO_VELOCITY = 12
+    MODE_STAY_WITHIN = 13
+
+    # Fault Constants
+    FAULT_OK = 0
+    FAULT_CALIBRATION = 32
+    FAULT_MOTOR_DRV = 33
+    FAULT_OVER_VOLTAGE = 34
+    FAULT_ENCODER = 35
+    FAULT_MOTOR_NOT_CONFG = 36
+    FAULT_PWM_CYCLE_OVERRUN = 37
+    FAULT_OVER_TEMP = 38
+    FAULT_OUTSIDE_LIMIT = 39
+
     def __init__(self, id):
-        # 2 / {MODE(0x000): 3, POSITION(0x001): 0.0790252685546875,
-        #      VELOCITY(0x002): 0.07530862092971802, TORQUE(0x003): 0.0, VOLTAGE(0x00d): 23.5,
-        #      TEMPERATURE(0x00e): 29.0, FAULT(0x00f): 0}
         self.id = id
         self.stamp = time.time()
-        self.mode = 0
+        self.mode = ControllerState.MODE_STOPPED
         self.position = 0
         self.velocity = 0
         self.torque = 0
         self.voltage = 0
         self.temperature = 0
-        self.fault = 0
+        self.fault = ControllerState.FAULT_OK
         self.position_offset_dist = 0
         self.position_offset_ang = 0
         self.position_ang = 0
@@ -98,7 +116,6 @@ class ControllerState:
     def set_offset(self, state):
         self.position_offset_dist = (state.values[moteus.Register.POSITION] * RobotSpec.ROTATION_DISTANCE)
         self.position_offset_ang = (state.values[moteus.Register.POSITION] * RobotSpec.MOT_RPS_TO_WHEEL_RAD)
-        # print("############################## {}".format(self.position_offset_dist))
 
     def get_status_msg(self, side=1):  # side -1 left, 1 right
         msg = Moteus_controller_state()
@@ -113,49 +130,49 @@ class ControllerState:
         return msg
 
     def get_mode(self, code):
-        if code == 0:
+        if code == ControllerState.MODE_STOPPED:
             return "STOPPED"
-        elif code == 1:
+        elif code == ControllerState.MODE_FAULT:
             return "FAULT"
-        elif code == 5:
+        elif code == ControllerState.MODE_PWM:
             return "PWM"
-        elif code == 6:
+        elif code == ControllerState.MODE_VOLTAGE:
             return "VOLTAGE"
-        elif code == 7:
+        elif code == ControllerState.MODE_VOLTAGE_FOC:
             return "VOLTAGE_FOC"
-        elif code == 8:
+        elif code == ControllerState.MODE_VOLTAGE_DQ:
             return "VOLTAGE_DQ"
-        elif code == 9:
+        elif code == ControllerState.MODE_CURRENT:
             return "CURRENT"
-        elif code == 10:
+        elif code == ControllerState.MODE_POSITION:
             return "POSITION"
-        elif code == 11:
+        elif code == ControllerState.MODE_TIMEOUT:
             return "TIMEOUT"
-        elif code == 12:
+        elif code == ControllerState.MODE_ZERO_VELOCITY:
             return "ZERO_VELOCITY"
-        elif code == 13:
+        elif code == ControllerState.MODE_STAY_WITHIN:
             return "STAY_WITHIN"
         else:
             return str(code)
 
     def get_fault(self, code):
-        if code == 0:
+        if code == ControllerState.FAULT_OK:
             return "OK"
-        elif code == 32:
+        elif code == ControllerState.FAULT_CALIBRATION:
             return "CALIBRATION_FAULT"
-        elif code == 33:
+        elif code == ControllerState.FAULT_MOTOR_DRV:
             return "MOTOR_DRV_FAULT"
-        elif code == 34:
+        elif code == ControllerState.FAULT_OVER_VOLTAGE:
             return "OVER_VOLTAGE"
-        elif code == 35:
+        elif code == ControllerState.FAULT_ENCODER:
             return "ENCODER_FAULT"
-        elif code == 36:
+        elif code == ControllerState.FAULT_MOTOR_NOT_CONFG:
             return "MOTOR_NOT_CONFG"
-        elif code == 37:
+        elif code == ControllerState.FAULT_PWM_CYCLE_OVERRUN:
             return "PWM_CYCLE_OVERRUN"
-        elif code == 38:
+        elif code == ControllerState.FAULT_OVER_TEMP:
             return "OVER_TEMP"
-        elif code == 39:
+        elif code == ControllerState.FAULT_OUTSIDE_LIMIT:
             return "OUTSIDE_LIMIT"
         else:
             return str(code)
@@ -167,7 +184,7 @@ class MotorController:
         self.c = moteus.Controller(self.id)
         self.state = ControllerState(self.id)
         self.velocity = 0
-        # self.set_offset()
+
 
 class BaseController:
     def __init__(self):
@@ -176,8 +193,22 @@ class BaseController:
         self.c_rear_left = MotorController(RobotSpec.REAR_LEFT_ID)
         self.c_rear_right = MotorController(RobotSpec.REAR_RIGHT_ID)
 
+        # Configuration for each motor
+        self.motor_configs = [
+            {'obj': self.c_front_left,  'name': "FRONT_LEFT",  'vel_cmd_multiplier': -1, 'ros_name_prefix': 'front_left'},
+            {'obj': self.c_front_right, 'name': "FRONT_RIGHT", 'vel_cmd_multiplier':  1, 'ros_name_prefix': 'front_right'},
+            {'obj': self.c_rear_left,   'name': "REAR_LEFT",   'vel_cmd_multiplier': -1, 'ros_name_prefix': 'rear_left'},
+            {'obj': self.c_rear_right,  'name': "REAR_RIGHT",  'vel_cmd_multiplier':  1, 'ros_name_prefix': 'rear_right'},
+        ]
+
+        # Motor command parameters (previously magic numbers)
+        self.MOTOR_FF_TORQUE = -0.1  # Consider if this needs to be directional
+        self.MOTOR_KP_SCALE = 2.0
+        self.MOTOR_KD_SCALE = 1.0
+        self.MOTOR_WATCHDOG_TIMEOUT = 0.5
+        self.DEFAULT_MAX_TORQUE = RobotSpec.TORQUE # Default max torque from RobotSpec
+
         # This will be updated by the ROS thread in the background.
-        # The lock must be held when reading or writing it.
         self.lock = threading.Lock()
         self.current_request = None
         self.motors_switch = False
@@ -220,187 +251,96 @@ class BaseController:
                 wait_int_counter = 0
             wait_int_counter +=1
 
-        await self.c_front_left.c.set_stop()
-        await self.c_front_right.c.set_stop()
-        await self.c_rear_left.c.set_stop()
-        await self.c_rear_right.c.set_stop()
+        for config in self.motor_configs:
+            if config['obj'].c:
+                await config['obj'].c.set_stop()
 
-        # self.c_front_left.state.set_offset(state_front_left)
-        # self.c_front_right.state.set_offset(state_front_right)
-        # self.c_rear_left.state.set_offset(state_rear_left)
-        # self.c_rear_right.state.set_offset(state_rear_right)
         start_time = time.time()
         while True:
 
             if self.stop_controller:
                 if self.controller_status:
                     rospy.logwarn("Controller shutting down...")
-                    # if (self.c_front_left.c != None):
-                    await self.c_front_left.c.set_stop()
-                    await self.c_front_right.c.set_stop()
-                    await self.c_rear_left.c.set_stop()
-                    await self.c_rear_right.c.set_stop()
-
-                    # self.c_front_left.state.set_offset(state_front_left)
-                    # self.c_front_right.state.set_offset(state_front_right)
-                    # self.c_rear_left.state.set_offset(state_rear_left)
-                    # self.c_rear_right.state.set_offset(state_rear_right)
-                    self.c_front_left.c = None
-                    self.c_front_right.c = None
-                    self.c_rear_left.c = None
-                    self.c_rear_right.c = None
-                    ## Set controllers status to Failed and zero
-                    with self.lock:
-                        self.c_front_left.state.mode = "FAILED"
-                        self.c_front_left.state.position = 0.0
-                        self.c_front_left.state.velocity = 0.0
-                        self.c_front_left.state.torque = 0.0
-                        self.c_front_left.state.voltage = 0.0
-                        self.c_front_left.state.temperature = 0.0
-                        self.c_front_left.state.fault = "off"
-                    with self.lock:
-                        self.c_front_right.state.mode = "FAILED"
-                        self.c_front_right.state.position = 0.0
-                        self.c_front_right.state.velocity = 0.0
-                        self.c_front_right.state.torque = 0.0
-                        self.c_front_right.state.voltage = 0.0
-                        self.c_front_right.state.temperature = 0.0
-                        self.c_front_right.state.fault = "off"
-                    with self.lock:
-                        self.c_rear_left.state.mode = "FAILED"
-                        self.c_rear_left.state.position = 0.0
-                        self.c_rear_left.state.velocity = 0.0
-                        self.c_rear_left.state.torque = 0.0
-                        self.c_rear_left.state.voltage = 0.0
-                        self.c_rear_left.state.temperature = 0.0
-                        self.c_rear_left.state.fault = "off"
-                    with self.lock:
-                        self.c_rear_right.state.mode = "FAILED"
-                        self.c_rear_right.state.position = 0.0
-                        self.c_rear_right.state.velocity = 0.0
-                        self.c_rear_right.state.torque = 0.0
-                        self.c_rear_right.state.voltage = 0.0
-                        self.c_rear_right.state.temperature = 0.0
-                        self.c_rear_right.state.fault = "off"
+                    for config in self.motor_configs:
+                        motor_obj = config['obj']
+                        if motor_obj.c:
+                            try:
+                                await motor_obj.c.set_stop()
+                            except Exception as e:
+                                rospy.logerr(f"Error stopping motor {motor_obj.id} ({config['name']}): {e}")
+                            motor_obj.c = None
+                        # Reset state more consistently
+                        with self.lock:
+                            motor_obj.state.mode = ControllerState.MODE_STOPPED
+                            motor_obj.state.position = 0.0
+                            motor_obj.state.velocity = 0.0
+                            motor_obj.state.torque = 0.0
+                            motor_obj.state.voltage = 0.0
+                            motor_obj.state.temperature = 0.0
+                            motor_obj.state.fault = ControllerState.FAULT_OK
+                    
                     with self.lock:
                         self.stop_controller = False
                     with self.lock:
                         self.stop_power = True
                     with self.lock:
                         self.controller_status = False
-                    rospy.logwarn("Controller is shutted down.")
+                    rospy.logwarn("Controller is shut down.")
 
             if self.start_controller:
                 rospy.loginfo("Controller starting...")
-                self.c_front_left.c = moteus.Controller(RobotSpec.FRONT_LEFT_ID)
-                self.c_front_right.c = moteus.Controller(RobotSpec.FRONT_RIGHT_ID)
-                self.c_rear_left.c = moteus.Controller(RobotSpec.REAR_LEFT_ID)
-                self.c_rear_right.c = moteus.Controller(RobotSpec.REAR_RIGHT_ID)
+                for config in self.motor_configs:
+                    motor_obj = config['obj']
+                    # Re-initialize controller object if it's None or not the right type
+                    if not isinstance(motor_obj.c, moteus.Controller):
+                         motor_obj.c = moteus.Controller(motor_obj.id)
+                    
+                    if motor_obj.c: # Ensure it was created
+                        await motor_obj.c.set_stop()
+                        # Set initial position to current encoder reading, or zero.
+                        # Using make_set_output_nearest ensures it starts from current position.
+                        motor_obj.c.make_set_output_nearest(position=0.0) # Or math.nan if you want it to hold current
 
-                await self.c_front_left.c.set_stop()
-                await self.c_front_right.c.set_stop()
-                await self.c_rear_left.c.set_stop()
-                await self.c_rear_right.c.set_stop()
-
-                self.c_front_left.c.make_set_output_nearest(position=0.0)
-                self.c_front_right.c.make_set_output_nearest(position=0.0)
-                self.c_rear_left.c.make_set_output_nearest(position=0.0)
-                self.c_rear_right.c.make_set_output_nearest(position=0.0)
                 with self.lock:
                     self.start_controller = False
                     self.controller_status = True
                 rospy.loginfo("Controller started.")
 
             ### Set controllers velocities and read states #######
-            # front left
-            with self.lock:
-                vel = self.c_front_left.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS * -1
-            with self.lock:
-                torq = RobotSpec.torque_recent
-            if (self.c_front_left.c):
-                await self.c_front_left.c.set_position(
-                    position=math.nan,
-                    velocity=vel,
-                    feedforward_torque=-0.1,
-                    kp_scale=2,
-                    kd_scale=1,
-                    maximum_torque=torq,
-                    stop_position=None,
-                    watchdog_timeout=0.5,
-                    # velocity_limit=125,
-                    # accel_limit=0.01,
-                    query=False)
-                state_front_left = await self.c_front_left.c.query()
-                with self.lock:
-                    self.c_front_left.state.set_values(state_front_left)
+            with self.lock: # Lock for accessing shared RobotSpec.torque_recent
+                current_max_torque = RobotSpec.torque_recent if RobotSpec.torque_recent > 0 else self.DEFAULT_MAX_TORQUE
+            
+            for config in self.motor_configs:
+                motor_obj = config['obj']
+                vel_cmd_multiplier = config['vel_cmd_multiplier']
 
-            # front right
-            with self.lock:
-                vel = self.c_front_right.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS
-            with self.lock:
-                torq = RobotSpec.torque_recent
-            if (self.c_front_right.c):
-                await self.c_front_right.c.set_position(
-                    position=math.nan,
-                    velocity=vel,
-                    feedforward_torque=-0.1,
-                    kp_scale=2,
-                    kd_scale=1,
-                    maximum_torque=torq,
-                    stop_position=None,
-                    watchdog_timeout=0.5,
-                    # velocity_limit=125,
-                    # accel_limit=0.01,
-                    query=False)
-                # print("a2")
-                state_front_right = await self.c_front_right.c.query()
-                with self.lock:
-                    self.c_front_right.state.set_values(state_front_right)
+                with self.lock: # Lock for accessing motor_obj.velocity set by ROS callbacks
+                    # Convert target wheel velocity (rad/s) to motor velocity (RPS)
+                    motor_target_rps = motor_obj.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS * vel_cmd_multiplier
+                
+                if motor_obj.c: # If controller is active
+                    try:
+                        await motor_obj.c.set_position(
+                            position=math.nan, # Position control mode, but target is velocity
+                            velocity=motor_target_rps,
+                            feedforward_torque=self.MOTOR_FF_TORQUE, # Applied as is, sign might need to depend on velocity
+                            kp_scale=self.MOTOR_KP_SCALE,
+                            kd_scale=self.MOTOR_KD_SCALE,
+                            maximum_torque=current_max_torque,
+                            stop_position=None, # No specific stop position for pure velocity control
+                            watchdog_timeout=self.MOTOR_WATCHDOG_TIMEOUT,
+                            query=False) # Query separately for all motors after sending all commands potentially
+                        
+                        state_data = await motor_obj.c.query()
+                        if state_data:
+                            with self.lock: # Lock for updating shared motor_obj.state
+                                motor_obj.state.set_values(state_data)
+                        else:
+                            rospy.logwarn(f"No state data received for motor {motor_obj.id} ({config['name']})")
 
-            # rear left
-            with self.lock:
-                vel = self.c_rear_left.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS * -1
-            with self.lock:
-                torq = RobotSpec.torque_recent
-            if (self.c_rear_left.c):
-                await self.c_rear_left.c.set_position(
-                    position=math.nan,
-                    velocity=vel,
-                    feedforward_torque=-0.1,
-                    kp_scale=2,
-                    kd_scale=1,
-                    maximum_torque=torq,
-                    stop_position=None,
-                    watchdog_timeout=0.5,
-                    # velocity_limit=125,
-                    # accel_limit=0.01,
-                    query=False)
-                state_rear_left = await self.c_rear_left.c.query()
-                with self.lock:
-                    self.c_rear_left.state.set_values(state_rear_left)
-
-            # rear right
-            with self.lock:
-                vel = self.c_rear_right.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS
-            with self.lock:
-                torq = RobotSpec.torque_recent
-            if (self.c_rear_right.c):
-                await self.c_rear_right.c.set_position(
-                    position=math.nan,
-                    velocity=vel,
-                    feedforward_torque=-0.1,
-                    kp_scale=2,
-                    kd_scale=1,
-                    maximum_torque=torq,
-                    stop_position=None,
-                    watchdog_timeout=0.5,
-                    # velocity_limit=125,
-                    # accel_limit=0.01,
-                    query=False)
-                state_rear_right = await self.c_rear_right.c.query()
-                with self.lock:
-                    self.c_rear_right.state.set_values(state_rear_right)
-
+                    except Exception as e:
+                        rospy.logerr(f"Error commanding/querying motor {motor_obj.id} ({config['name']}): {e}")
+            
             await asyncio.sleep(0.01)
 
     def publish_velocity(self):
@@ -494,7 +434,6 @@ class BaseController:
     def callback_pm_set_motor_switch(self, msg):
         if not msg.data:
             with self.lock:
-                pass
                 self.stop_controller = True
 
 async def main():
@@ -503,7 +442,6 @@ async def main():
     # Start ROS in a thread separate from the asyncio one.
     def start_ros():
         # Publisher to motor switch on the power module and subscriber for motor switch check.
-        # global motors_power_switch
         controller.motors_switch_pub = rospy.Publisher("/pm/set_motor_switch", Bool, queue_size=10)
         controller.motors_power_switch = rospy.Subscriber('/pm/power_status', Power_status, controller.callback_power_status)
 
@@ -542,7 +480,7 @@ async def main():
 
                 controller.stop_power = False
                 if first_run:
-                    time.sleep(1)
+                    rospy.sleep(1)
                     controller.start_power = True
                     first_run = False
 
@@ -553,7 +491,7 @@ async def main():
                 controller.motors_switch_pub.publish(new_msg)
                 rospy.loginfo("Wait for Power module enable motor power output...")
                 while not controller.motors_switch:
-                    time.sleep(0.3)
+                    rospy.sleep(0.3)
                 rospy.loginfo("Motor power output enabled.")
 
                 controller.start_power = False
@@ -574,22 +512,23 @@ async def main():
 
             #### over all status ####################
             new_msg = Bool()
-            if controller.controller_status:
-                if (RobotSpec.torque_recent == 0.0 or
-                        controller.c_front_left.state.fault != 0 or
-                        controller.c_front_right.state.fault != 0 or
-                        controller.c_rear_left.state.fault != 0 or
-                        controller.c_rear_right.state.fault != 0 or
-                        controller.c_front_left.state.mode != 10 or
-                        controller.c_front_right.state.mode != 10 or
-                        controller.c_rear_left.state.mode != 10 or
-                        controller.c_rear_right.state.mode != 10):
-                    new_msg.data = False
-                else:
-                    new_msg.data = True
-            else:
-                new_msg.data = False
+            overall_status_ok = True # Assume OK initially
 
+            if not controller.controller_status: # If controller itself is not active
+                overall_status_ok = False
+            elif RobotSpec.torque_recent == 0.0: # If torque is set to zero (motors might be intentionally disabled)
+                overall_status_ok = False
+            else:
+                # Check each motor's state using motor_configs
+                for config in controller.motor_configs:
+                    motor_state = config['obj'].state
+                    with controller.lock: # Ensure thread-safe access to motor_state
+                        if motor_state.fault != ControllerState.FAULT_OK or \
+                           motor_state.mode != ControllerState.MODE_POSITION: # Assuming MODE_POSITION is the desired operational mode
+                            overall_status_ok = False
+                            break # A single motor fault or wrong mode makes overall status not OK
+            
+            new_msg.data = overall_status_ok
             pub_motor_power_state.publish(new_msg)
 
             new_msg = Float32()
