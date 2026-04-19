@@ -19,6 +19,7 @@ conf set servo.flux_brake_min_voltage 26.0
 conf set servo.default_timeout_s nan
 conf set servo.pwm_rate_hz 15000
 conf set servo.derate_temperature 60
+conf set servo.max_voltage 30.0
 conf write
 
 
