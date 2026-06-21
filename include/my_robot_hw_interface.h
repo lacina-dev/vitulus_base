@@ -54,6 +54,7 @@
 #include <hardware_interface/robot_hw.h>
 // ostringstream
 #include <sstream>
+#include <cmath>
 
 const unsigned int NUM_JOINTS = 4;  // 2
 
@@ -94,23 +95,37 @@ public:
    * Reading encoder values and setting position and velocity of enconders 
    */
   void read(const ros::Duration &period) {
+    // Continuity guard against motor-enable encoder discontinuities. On motor
+    // power-up the wheel controllers re-initialise their absolute angle, so
+    // _wheel_angle takes a one-cycle non-physical jump; assigning it straight to
+    // pos[] made diff_drive_controller derive a huge odom velocity spike (observed
+    // -193..-550 m/s, growing with distance driven) that teleported the fused
+    // pose. Fix: integrate pos[] from per-cycle angle deltas and DROP any delta
+    // beyond the physical maximum (max wheel speed * period). Normal motion is far
+    // below the cap, so real odometry is unaffected (zero impact); only the
+    // power-up glitch is rejected, keeping pos[] continuous (no pose jump).
+    double dt = period.toSec();
+    if (dt < 0.02) dt = 0.02;                    // floor to nominal 50 Hz cycle
+    const double max_delta = _max_speed * dt * 3.0;   // generous physical cap [rad]
 
-    double ang_distance_front_left = _wheel_angle[0];
-    double ang_distance_front_right = _wheel_angle[1];
-    double ang_distance_rear_left = _wheel_angle[2];
-    double ang_distance_rear_right = _wheel_angle[3];
-    pos[0] = ang_distance_front_left;
-    vel[0] = _wheel_real_vel[0];
-    pos[1] = ang_distance_front_right;
-    vel[1] = _wheel_real_vel[1];
-    pos[2] = ang_distance_rear_left;
-    vel[2] = _wheel_real_vel[2];
-    pos[3] = ang_distance_rear_right;
-    vel[3] = _wheel_real_vel[3];
-//    ROS_INFO_STREAM("Velocity: " << vel[3]);
-
-
-
+    for (unsigned int i = 0; i < NUM_JOINTS; ++i) {
+      double raw = _wheel_angle[i];
+      if (!_angle_init) {
+        pos[i] = raw;
+      } else {
+        double d = raw - _prev_wheel_angle[i];
+        if (std::fabs(d) > max_delta) {
+          ROS_WARN_THROTTLE(1.0,
+            "[base_hw] rejected non-physical wheel %u angle jump %.2f rad (cap %.2f) "
+            "- likely motor-enable encoder reset", i, d, max_delta);
+          d = 0.0;                               // freeze this cycle, re-sync below
+        }
+        pos[i] += d;
+      }
+      _prev_wheel_angle[i] = raw;
+      vel[i] = _wheel_real_vel[i];
+    }
+    _angle_init = true;
   }
 
   ros::Time get_time() {
@@ -139,6 +154,8 @@ private:
   double _max_speed;
   double _wheel_angle[NUM_JOINTS];
   double _wheel_real_vel[NUM_JOINTS];
+  double _prev_wheel_angle[NUM_JOINTS];   // continuity-guard reference (see read())
+  bool _angle_init;
 
   ros::Time curr_update_time, prev_update_time;
 
@@ -232,6 +249,8 @@ MyRobotHWInterface::MyRobotHWInterface()
     std::fill_n(vel, NUM_JOINTS, 0.0);
     std::fill_n(eff, NUM_JOINTS, 0.0);
     std::fill_n(cmd, NUM_JOINTS, 0.0);
+    std::fill_n(_prev_wheel_angle, NUM_JOINTS, 0.0);
+    _angle_init = false;   // first read() seeds pos[] from the raw angle
 
     // connect and register the joint state and velocity interfaces
     for (unsigned int i = 0; i < NUM_JOINTS; ++i)
