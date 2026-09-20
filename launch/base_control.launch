@@ -24,7 +24,15 @@
           mobile_base_controller"/>
 
     <!-- HW Controller -->
-    <node pkg="vitulus_base" type="base_controller" name="base_controller" output="screen" respawn="true"/>
+    <!-- motors_on_at_start: drive motor power after EVERY start of this node (boot, stack
+         restart, respawn). false (default, safe) = the power-module motor output is forced
+         OFF and stays OFF until something deliberately publishes True on /base/motor_power
+         (UI / display button, dock_smach undock, docking controller). true = legacy
+         behaviour (power-cycle and enable the motors right after start). -->
+    <arg name="motors_on_at_start" default="false"/>
+    <node pkg="vitulus_base" type="base_controller" name="base_controller" output="screen" respawn="true">
+        <param name="motors_on_at_start" value="$(arg motors_on_at_start)"/>
+    </node>
 
 
 </launch>

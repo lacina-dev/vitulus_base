@@ -38,7 +38,7 @@ import moteus
 import threading
 import sys
 import signal
-from std_msgs.msg import Float32, Bool
+from std_msgs.msg import Float32, Bool, String
 from vitulus_msgs.msg import Moteus_controller_state, Power_status
 import traceback
 
@@ -221,6 +221,15 @@ class BaseController:
         self.start_power = False
         self.ros_ready = False
         self.controller_status = False
+        # Boot policy: drive motor power stays OFF after node start until something
+        # deliberately publishes True on /base/motor_power (~motors_on_at_start).
+        self.motors_on_at_start = False
+        self.power_on_pending = False     # True while an explicit power-on is in progress
+        self.pm_status_received = False   # first /pm/power_status seen
+        self.start_stamp = time.time()
+        # A latched True replayed by a publisher that outlived this node (respawn) is
+        # a stale command, not a deliberate enable - ignored for this long after start.
+        self.STALE_LATCH_IGNORE_S = 5.0
         self.pub_front_left_velocity = rospy.Publisher("/base/front_left_wheel_real_vel", Float32, queue_size=10)
         self.pub_front_right_velocity = rospy.Publisher("/base/front_right_wheel_real_vel", Float32, queue_size=10)
         self.pub_rear_left_velocity = rospy.Publisher("/base/rear_left_wheel_real_vel", Float32, queue_size=10)
@@ -243,6 +252,11 @@ class BaseController:
         wait_int_nr = 10
         while not self.ros_ready:
             time.sleep(0.3)
+            # Motors may legitimately stay OFF here for a long time (boot default).
+            # Only nag the power module while a power-on was really requested.
+            if not self.power_on_pending:
+                wait_int_counter = 0
+                continue
             if (wait_int_nr == wait_int_counter):
                 rospy.logwarn("Still waiting for Power module enable motor power output...")
                 # send turn on message to power module again
@@ -399,6 +413,15 @@ class BaseController:
 
     def callback_motor_power(self, msg):
         if msg.data:
+            # Right after (re)start a latched publisher replays its LAST command.
+            # That is history (e.g. the undock hours ago), not a deliberate enable.
+            header = getattr(msg, '_connection_header', None) or {}
+            if (not self.motors_on_at_start
+                    and header.get('latching') == '1'
+                    and (time.time() - self.start_stamp) < self.STALE_LATCH_IGNORE_S):
+                rospy.logwarn("Ignoring latched motor power ON replayed at node start "
+                              "(from %s). Motors stay OFF." % header.get('callerid', '?'))
+                return
             with self.lock:
                 self.start_power = True
         else:
@@ -430,6 +453,7 @@ class BaseController:
     def callback_power_status(self, msg):
         with self.lock:
             self.motors_switch = msg.motor_out_switch
+            self.pm_status_received = True
 
     # Stop controller if motor output switch off message for power module is received.
     def callback_pm_set_motor_switch(self, msg):
@@ -462,6 +486,15 @@ async def main():
         rate = 50
         r = rospy.Rate(rate)  # Hz
 
+        # Motor power after node start (boot, stack restart, respawn). Default False:
+        # the power module output is forced OFF and stays OFF until a True arrives
+        # on /base/motor_power. True restores the legacy power-cycle-and-enable.
+        controller.motors_on_at_start = bool(rospy.get_param('~motors_on_at_start', False))
+        # Cmd while motors are off -> tell the user instead of silently not moving.
+        pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+        cmd_while_off_since = None
+        cmd_while_off_warned = 0.0
+
         first_run = True
         controller.stop_power = True
         slow_counter = 0
@@ -471,22 +504,40 @@ async def main():
 
             ## Turn off the motor switch in power module
             if controller.stop_power:
+                if first_run:
+                    # The very first OFF must really reach the power module: wait
+                    # (bounded) until it reports, otherwise the message is published
+                    # before the connection exists and a switch left ON by a killed
+                    # predecessor would go unnoticed.
+                    wait_start = time.time()
+                    while (not controller.pm_status_received and not rospy.is_shutdown()
+                           and (time.time() - wait_start) < 10.0):
+                        time.sleep(0.1)
+                    if not controller.pm_status_received:
+                        rospy.logwarn("No /pm/power_status yet - motor power OFF not verified.")
                 new_msg = Bool()
                 new_msg.data = False
                 controller.motors_switch_pub.publish(new_msg)
                 rospy.loginfo("Wait for Power module disable motor power output...")
-                while controller.motors_switch:
+                while controller.motors_switch and not rospy.is_shutdown():
                     time.sleep(0.3)
+                    if controller.motors_switch:
+                        controller.motors_switch_pub.publish(new_msg)  # repeat until confirmed
                 rospy.loginfo("Motor power output disabled.")
 
                 controller.stop_power = False
                 if first_run:
-                    rospy.sleep(1)
-                    controller.start_power = True
                     first_run = False
+                    if controller.motors_on_at_start:
+                        rospy.sleep(1)
+                        controller.start_power = True
+                    else:
+                        rospy.loginfo("Motor power stays OFF after start "
+                                      "(~motors_on_at_start=false). Waiting for /base/motor_power.")
 
             ## Turn on the motor switch in power module
             if controller.start_power:
+                controller.power_on_pending = True
                 new_msg = Bool()
                 new_msg.data = True
                 controller.motors_switch_pub.publish(new_msg)
@@ -495,6 +546,7 @@ async def main():
                     rospy.sleep(0.3)
                 rospy.loginfo("Motor power output enabled.")
 
+                controller.power_on_pending = False
                 controller.start_power = False
                 # let the conrollers in asyncio start too
                 controller.start_controller = True
@@ -531,6 +583,24 @@ async def main():
             
             new_msg.data = overall_status_ok
             pub_motor_power_state.publish(new_msg)
+
+            #### velocity commanded into unpowered motors -> user-facing message ####
+            # Nothing here powers the motors (fail safe); whoever starts motion has to
+            # enable them deliberately. Without this the robot just "does nothing".
+            with controller.lock:
+                cmd_active = any(abs(config['obj'].velocity) > 0.05
+                                 for config in controller.motor_configs)
+            if cmd_active and not controller.controller_status and not controller.start_power:
+                now = time.time()
+                if cmd_while_off_since is None:
+                    cmd_while_off_since = now
+                elif (now - cmd_while_off_since) > 1.0 and (now - cmd_while_off_warned) > 5.0:
+                    cmd_while_off_warned = now
+                    rospy.logwarn("Velocity command received but drive motors are OFF - "
+                                  "not moving. Enable motor power (/base/motor_power).")
+                    pub_log_info.publish(String("Motors are OFF - turn motors on to move"))
+            else:
+                cmd_while_off_since = None
 
             new_msg = Float32()
             new_msg.data = RobotSpec.torque_recent * RobotSpec.REDUCER
