@@ -275,7 +275,7 @@ class BaseController:
 
             if self.stop_controller:
                 if self.controller_status:
-                    rospy.logwarn("Controller shutting down...")
+                    rospy.loginfo("Controller shutting down...")
                     for config in self.motor_configs:
                         motor_obj = config['obj']
                         if motor_obj.c:
@@ -300,7 +300,7 @@ class BaseController:
                         self.stop_power = True
                     with self.lock:
                         self.controller_status = False
-                    rospy.logwarn("Controller is shut down.")
+                    rospy.loginfo("Controller is shut down.")
 
             if self.start_controller:
                 rospy.loginfo("Controller starting...")
