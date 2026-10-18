@@ -19,6 +19,10 @@ Cases
   6  DS4 PS button                         -> takeover without moving a stick
   7  web joystick vs DS4                   -> DS4 ranks higher; web alone wins over nav
   9  mower_smach idle / mowing             -> /mower_smach/stop only while mowing
+  10 drive_primitive vs nav               -> primitive owns the wheels while it talks
+                                              (zeros too); nav again 0.5 s after it
+                                              stops; teleop beats primitive and the
+                                              takeover sends /drive_primitive/stop
   8  mux stopped                           -> nothing reaches the base
 """
 import json
@@ -89,7 +93,10 @@ def main():
         web_pub = rospy.Publisher('/teleop/cmd_vel', Twist, queue_size=1)
         st_pub = rospy.Publisher('/ds4/status', Status, queue_size=1)
 
-        drive = {'nav': None, 'ds4': 0.0, 'web': None}   # None = silent
+        prim_pub = rospy.Publisher('/drive_primitive/cmd_vel', Twist, queue_size=1)
+        prim_stops = []
+        rospy.Subscriber('/drive_primitive/stop', Bool, rec(prim_stops), queue_size=100)
+        drive = {'nav': None, 'ds4': 0.0, 'web': None, 'prim': None}   # None = silent
 
         def tw(lin, ang=0.0):
             m = Twist()
@@ -108,7 +115,8 @@ def main():
                 time.sleep(period)
         threads = [threading.Thread(target=pump, args=(nav_pub, 'nav', 10), daemon=True),
                    threading.Thread(target=pump, args=(ds4_pub, 'ds4', 250), daemon=True),
-                   threading.Thread(target=pump, args=(web_pub, 'web', 20), daemon=True)]
+                   threading.Thread(target=pump, args=(web_pub, 'web', 20), daemon=True),
+                   threading.Thread(target=pump, args=(prim_pub, 'prim', 20), daemon=True)]
         for t in threads:
             t.start()
         # wait for the mux to be connected
@@ -282,6 +290,48 @@ def main():
             m2 = len(mower_stops)
         ok('program running: 3 stops incl. /mower_smach/stop', len(s) == 3 and m2 == m1 + 1,
            '%d %d' % (len(s), m2 - m1))
+        time.sleep(3.0)
+
+        print('10 drive_primitive vs nav')
+        drive['nav'] = 0.3
+        time.sleep(1.0)
+        drive['prim'] = 0.12
+        time.sleep(0.3)
+        o, c, s, t = window(2.0)
+        vals = set(round(m.linear.x, 3) for _, m in o)
+        ok('primitive beats nav (only 0.12)', vals == {0.12}, vals)
+        ok('status primitive', status[-1]['active'] == 'primitive', status[-1])
+        ok('the dropped nav command is listed', bool(status[-1]['nav_blocked']), status[-1])
+        ok('no takeover, no cancel for software priority', not t and not c, (len(t), len(c)))
+        drive['prim'] = 0.0
+        time.sleep(0.2)
+        o, c, s, t = window(1.5)
+        vals = set(round(m.linear.x, 3) for _, m in o)
+        ok('primitive zeros hold nav down', vals == {0.0}, vals)
+        drive['prim'] = None
+        t_q = time.monotonic()
+        o, c, s, t = window(2.0)
+        late = [round(m.linear.x, 3) for ts, m in o if ts - t_q > 0.7]
+        early = [round(m.linear.x, 3) for ts, m in o if ts - t_q < 0.4]
+        ok('nav drives again after 0.5 s of primitive silence',
+           len(late) >= 8 and set(late) == {0.3}, late[:5])
+        ok('nav still dropped right after primitive stopped', 0.3 not in early, early)
+        drive['prim'] = 0.12
+        time.sleep(0.5)
+        with lk:
+            p0 = len(prim_stops)
+        drive['web'] = 0.2
+        o, c, s, t = window(1.5)
+        vals = set(round(m.linear.x, 3) for _, m in o[3:])
+        ok('teleop beats primitive', vals == {0.2}, vals)
+        ok('takeover teleop', [m.data for _, m in t] == ['teleop'], [m.data for _, m in t])
+        with lk:
+            p1 = len(prim_stops)
+        ok('takeover sends /drive_primitive/stop', p1 == p0 + 1 and prim_stops[-1][1].data,
+           p1 - p0)
+        drive['web'] = None
+        drive['prim'] = None
+        drive['nav'] = None
         time.sleep(3.0)
 
         print('8  mux stopped -> nothing reaches the base')

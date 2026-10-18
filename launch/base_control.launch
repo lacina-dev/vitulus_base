@@ -13,7 +13,8 @@
     <!-- cmd_vel_mux (18. 10. 2026): a person on the controls beats the software.
          The diff_drive controller listens on its own /mobile_base_controller/cmd_vel
          and ONLY the mux publishes there: DS4 (/ds4/cmd_vel) > web joystick / keyboard
-         (/teleop/cmd_vel) > all software (/cmd_vel: MBF, docking, mower recovery,
+         (/teleop/cmd_vel) > drive_primitive (/drive_primitive/cmd_vel, while it
+         talks) > all software (/cmd_vel: MBF, docking, mower recovery,
          agent supervisor). A deflected stick cancels the software's goals once;
          centred-stick zeros never block the software. See nodes/cmd_vel_mux.
          If the mux is not running nothing reaches the wheels - the robot stands.
@@ -24,6 +25,19 @@
     </node>
     <node name="cmd_vel_mux" pkg="vitulus_base" type="cmd_vel_mux" output="screen"
           respawn="true" respawn_delay="1" if="$(arg cmd_vel_mux)"/>
+
+    <!-- drive_primitive (18. 10. 2026): closed-loop direct driving (straight /
+         rotate / short velocity) on the mux input /drive_primitive/cmd_vel,
+         priority 50 = above all software on /cmd_vel, always below the web
+         joystick and the DS4.  Stops itself on takeover, /drive_primitive/stop,
+         lost keepalive, obstacle in the direction of travel, stale odometry or
+         lidar, motors off.  Needs the mux (without it nothing would reach the
+         wheels anyway).  drive_primitive:=false = not started. -->
+    <arg name="drive_primitive" default="true"/>
+    <group if="$(arg cmd_vel_mux)">
+        <node name="drive_primitive" pkg="vitulus_base" type="drive_primitive" output="screen"
+              respawn="true" respawn_delay="1" if="$(arg drive_primitive)"/>
+    </group>
 
 
 

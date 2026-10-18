@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""drive_primitive - closed-loop direct driving: straight, rotate, short velocity.
+
+A robot feature (works without any agent): one small motion at a time, driven
+in a closed loop on odometry, with the robot's own guards.  It publishes on
+its own cmd_vel_mux input /drive_primitive/cmd_vel (priority 50: above all
+software on /cmd_vel - MBF, docking - and always below the human inputs
+/teleop/cmd_vel and /ds4/cmd_vel).  A person on the controls always wins.
+
+Interface
+  in  /drive_primitive/command    std_msgs/String  JSON, one motion:
+        {"id": str,                       (required, echoed in status)
+         "kind": "straight"|"rotate"|"velocity",
+         "distance_m": f,   straight, +forward / -reverse, 0.02 <= |d| <= ~max_distance
+         "speed": f,        straight m/s 0.05..~max_linear (default 0.15)
+                            rotate rad/s 0.1..~max_angular (default 0.4)
+         "angle_deg": f,    rotate, +left (CCW) / -right, 1 <= |a| <= 360
+         "v": f, "w": f,    velocity, |v| <= ~max_linear, |w| <= ~max_angular
+         "duration_s": f,   velocity, 0 < t <= ~max_velocity_duration
+         "keepalive_s": f,  0 = none; otherwise a deadman: no /drive_primitive/
+                            keepalive with this id for keepalive_s -> ABORTED
+         "require_supervisor": bool, the agent's test_supervisor must be
+                            RUNNING and fresh the whole time
+         "cancel_nav": bool, cancel MBF / smach_goal goals once at the start
+         "max_duration_s": f  hard cap (default derived from the motion)}
+  in  /drive_primitive/stop       std_msgs/Bool    True -> ABORTED 'stop', zero
+  in  /drive_primitive/keepalive  std_msgs/String  the running command's id
+  out /drive_primitive/cmd_vel    geometry_msgs/Twist  20 Hz while running,
+                                  3 zeros at the end, silent otherwise
+  out /drive_primitive/status     std_msgs/String  JSON, latched, on change + 2 Hz:
+        {"id", "state": IDLE|RUNNING|SUCCEEDED|ABORTED|REJECTED, "reason",
+         "kind", "target", "done_m", "done_deg", "elapsed_s", "clearance_m", "t"}
+
+Guards (any one -> ABORTED with the reason; at the start -> REJECTED, nothing
+moves): human takeover (/cmd_vel_mux/active ds4|teleop, /cmd_vel_mux/takeover),
+stop, keepalive lost, supervisor not RUNNING/stale (when required), drive
+motors off (/base/motor_power_state False), stale odometry (> ~odom_timeout),
+stale or missing lidar (> ~scan_timeout), obstacle in the direction of travel
+(corridor of the footprint width + ~side_margin, out to ~stop_distance plus
+the braking distance v^2/2a; for rotation any point inside the circumscribed
+circle + ~rotate_clearance), no progress (~stuck_s), timeout.
+
+Limits: ~max_linear 0.3 m/s, ~max_angular 0.8 rad/s, ramps ~acc_linear
+0.25 m/s^2, ~acc_angular 0.8 rad/s^2, slow-down before the target
+(v <= sqrt(2 a remaining)), tolerance 0.02 m / 2 deg.
+"""
+import json
+import math
+import threading
+import time
+
+STATES = ('IDLE', 'RUNNING', 'SUCCEEDED', 'ABORTED', 'REJECTED')
+HUMAN_INPUTS = ('ds4', 'teleop')
+
+DEFAULTS = {
+    'max_linear': 0.3, 'max_angular': 0.8,
+    'acc_linear': 0.25, 'acc_angular': 0.8,
+    'max_distance': 2.0, 'max_velocity_duration': 5.0,
+    'stop_distance': 0.30, 'side_margin': 0.05, 'rotate_clearance': 0.10,
+    'footprint_front': 0.238, 'footprint_rear': 0.288, 'footprint_half_width': 0.256,
+    'odom_timeout': 0.5, 'scan_timeout': 0.5, 'supervisor_max_age': 1.0,
+    'stuck_s': 3.0, 'pos_tolerance': 0.02, 'angle_tolerance_deg': 2.0,
+    'heading_gain': 1.5, 'rate_hz': 20.0,
+    'min_linear': 0.03, 'min_angular': 0.08,
+}
+
+
+def wrap(a):
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+class Rejected(ValueError):
+    pass
+
+
+class Driver(object):
+    """The motion logic, free of rospy.  Inputs are fed through the on_*
+    methods, `step(now)` returns the Twist to send as (v, w) or None."""
+
+    def __init__(self, params=None, clock=time.monotonic, on_cancel_nav=None,
+                 warn=None):
+        self.p = dict(DEFAULTS)
+        self.p.update(params or {})
+        self.clock = clock
+        self.on_cancel_nav = on_cancel_nav or (lambda: None)
+        self.warn = warn or (lambda text: None)
+        self.lock = threading.RLock()
+        self.odom = None          # (t, x, y, yaw)
+        self.points = None        # (t, [(x, y)] in base_link)
+        self.motor = None         # (t, bool)
+        self.mux_active = None
+        self.supervisor = None    # (t, state)
+        self.cmd = None
+        self.status = {'id': None, 'state': 'IDLE', 'reason': None, 'kind': None,
+                       'target': None, 'done_m': None, 'done_deg': None,
+                       'elapsed_s': None, 'clearance_m': None}
+        self.zeros_left = 0
+        self.changed = True
+
+    # -- inputs ---------------------------------------------------------------
+    def on_odom(self, x, y, yaw):
+        with self.lock:
+            self.odom = (self.clock(), float(x), float(y), float(yaw))
+
+    def on_points(self, pts):
+        with self.lock:
+            self.points = (self.clock(), list(pts))
+
+    def on_motor(self, powered):
+        with self.lock:
+            self.motor = (self.clock(), bool(powered))
+
+    def on_mux_active(self, name):
+        with self.lock:
+            self.mux_active = (name or '').strip()
+            if self.cmd and self.mux_active in HUMAN_INPUTS:
+                self._end('ABORTED', 'human takeover (%s)' % self.mux_active)
+
+    def on_takeover(self, source):
+        with self.lock:
+            if self.cmd:
+                self._end('ABORTED', 'human takeover (%s)' % (source or 'human'))
+
+    def on_supervisor(self, state):
+        with self.lock:
+            self.supervisor = (self.clock(), str(state or ''))
+
+    def on_stop(self, flag=True):
+        with self.lock:
+            if flag and self.cmd:
+                self._end('ABORTED', 'stop')
+
+    def on_keepalive(self, cid):
+        with self.lock:
+            if self.cmd and cid == self.cmd['id']:
+                self.cmd['keepalive_t'] = self.clock()
+
+    # -- command --------------------------------------------------------------
+    def parse(self, raw):
+        try:
+            d = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except (ValueError, TypeError):
+            raise Rejected('command is not JSON')
+        if not isinstance(d, dict):
+            raise Rejected('command is not a JSON object')
+        cid = str(d.get('id') or '').strip()
+        if not cid:
+            raise Rejected('command has no id')
+        kind = d.get('kind')
+        p = self.p
+
+        def num(key, default=None):
+            val = d.get(key, default)
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                raise Rejected('%s must be a number' % key)
+            if not math.isfinite(val):
+                raise Rejected('%s must be finite' % key)
+            return val
+
+        cmd = {'id': cid, 'kind': kind,
+               'keepalive_s': num('keepalive_s', 0.0),
+               'require_supervisor': bool(d.get('require_supervisor', False)),
+               'cancel_nav': bool(d.get('cancel_nav', False))}
+        if cmd['keepalive_s'] < 0:
+            raise Rejected('keepalive_s must be >= 0')
+        if kind == 'straight':
+            dist = num('distance_m')
+            speed = num('speed', 0.15)
+            if not 0.02 <= abs(dist) <= p['max_distance']:
+                raise Rejected('distance_m must be 0.02..%.2f m (±)' % p['max_distance'])
+            if not 0.05 <= speed <= p['max_linear']:
+                raise Rejected('speed must be 0.05..%.2f m/s' % p['max_linear'])
+            cmd.update(target=dist, speed=speed)
+            nominal = abs(dist) / speed + speed / p['acc_linear']
+        elif kind == 'rotate':
+            ang = num('angle_deg')
+            speed = num('speed', 0.4)
+            if not 1.0 <= abs(ang) <= 360.0:
+                raise Rejected('angle_deg must be 1..360 (±)')
+            if not 0.1 <= speed <= p['max_angular']:
+                raise Rejected('speed must be 0.1..%.2f rad/s' % p['max_angular'])
+            cmd.update(target=math.radians(ang), speed=speed)
+            nominal = math.radians(abs(ang)) / speed + speed / p['acc_angular']
+        elif kind == 'velocity':
+            v, w, dur = num('v', 0.0), num('w', 0.0), num('duration_s')
+            if abs(v) > p['max_linear'] or abs(w) > p['max_angular']:
+                raise Rejected('|v| <= %.2f m/s, |w| <= %.2f rad/s'
+                               % (p['max_linear'], p['max_angular']))
+            if not 0.0 < dur <= p['max_velocity_duration']:
+                raise Rejected('duration_s must be 0..%.1f s' % p['max_velocity_duration'])
+            if v == 0.0 and w == 0.0:
+                raise Rejected('v and w are both zero')
+            cmd.update(v=v, w=w, target=dur)
+            nominal = dur
+        else:
+            raise Rejected('kind must be straight, rotate or velocity')
+        default_cap = 2.0 * nominal + 5.0
+        cap = num('max_duration_s', default_cap)
+        if cap <= 0:
+            raise Rejected('max_duration_s must be > 0')
+        cmd['max_duration_s'] = min(cap, default_cap * 2.0)
+        return cmd
+
+    def command(self, raw):
+        """Start a motion.  Returns the status dict."""
+        with self.lock:
+            try:
+                cmd = self.parse(raw)
+            except Rejected as exc:
+                cid = None
+                try:
+                    cid = (json.loads(raw) or {}).get('id') if isinstance(raw, str) else None
+                except Exception:  # noqa: BLE001
+                    pass
+                if self.cmd:
+                    self._end('ABORTED', 'superseded')
+                self._set(id=cid, state='REJECTED', reason=str(exc), kind=None,
+                          target=None, done_m=None, done_deg=None, elapsed_s=None)
+                return dict(self.status)
+            if self.cmd:
+                self._end('ABORTED', 'superseded')
+            now = self.clock()
+            cmd['t0'] = now
+            cmd['keepalive_t'] = now
+            cmd['vel'] = 0.0
+            cmd['progress_t'] = now
+            cmd['progress_val'] = 0.0
+            self.cmd = cmd
+            why = self._guards(now, start=True)
+            if why is None and self.odom is not None:
+                _t, x, y, yaw = self.odom
+                cmd['start'] = (x, y, yaw)
+                cmd['yaw_prev'] = yaw
+                cmd['turned'] = 0.0
+            self._set(id=cmd['id'], state='RUNNING', reason=None, kind=cmd['kind'],
+                      target=cmd['target'], done_m=0.0, done_deg=0.0, elapsed_s=0.0)
+            if why is not None:
+                self.cmd = None
+                self._set(state='REJECTED', reason=why)
+                return dict(self.status)
+            if cmd['cancel_nav']:
+                try:
+                    self.on_cancel_nav()
+                except Exception as exc:  # noqa: BLE001
+                    self.warn('cancel_nav failed: %s' % exc)
+            return dict(self.status)
+
+    # -- the loop -------------------------------------------------------------
+    def step(self, now=None):
+        """(v, w) to publish, or None for silence."""
+        with self.lock:
+            now = self.clock() if now is None else now
+            cmd = self.cmd
+            if cmd is None:
+                if self.zeros_left > 0:
+                    self.zeros_left -= 1
+                    return (0.0, 0.0)
+                return None
+            why = self._guards(now)
+            if why is not None:
+                self._end('ABORTED', why)
+                return self.step(now)
+            _t, x, y, yaw = self.odom
+            sx, sy, syaw = cmd['start']
+            cmd['turned'] += wrap(yaw - cmd['yaw_prev'])
+            cmd['yaw_prev'] = yaw
+            done_m = (x - sx) * math.cos(syaw) + (y - sy) * math.sin(syaw)
+            elapsed = now - cmd['t0']
+            self._set(done_m=round(done_m, 3), done_deg=round(math.degrees(cmd['turned']), 1),
+                      elapsed_s=round(elapsed, 2))
+            dt = max(0.0, min(0.2, now - cmd.get('last_step', now - 1.0 / self.p['rate_hz'])))
+            cmd['last_step'] = now
+            p = self.p
+            if cmd['kind'] == 'straight':
+                remaining = cmd['target'] - done_m
+                sign = 1.0 if cmd['target'] > 0 else -1.0
+                if remaining * sign <= p['pos_tolerance']:
+                    self._end('SUCCEEDED', 'reached %.2f m' % done_m)
+                    return self.step(now)
+                want = min(cmd['speed'], math.sqrt(2.0 * p['acc_linear'] * abs(remaining)))
+                want = max(want, p['min_linear'])
+                vel = self._ramp(cmd['vel'], sign * want, p['acc_linear'], dt)
+                cmd['vel'] = vel
+                w = -p['heading_gain'] * wrap(yaw - syaw)
+                w = max(-0.3, min(0.3, w))
+                if not self._check_progress(cmd, now, abs(done_m), abs(vel) > 0.05):
+                    return self.step(now)
+                return (vel, w)
+            if cmd['kind'] == 'rotate':
+                remaining = cmd['target'] - cmd['turned']
+                sign = 1.0 if cmd['target'] > 0 else -1.0
+                if remaining * sign <= math.radians(p['angle_tolerance_deg']):
+                    self._end('SUCCEEDED', 'turned %.1f deg' % math.degrees(cmd['turned']))
+                    return self.step(now)
+                want = min(cmd['speed'], math.sqrt(2.0 * p['acc_angular'] * abs(remaining)))
+                want = max(want, p['min_angular'])
+                vel = self._ramp(cmd['vel'], sign * want, p['acc_angular'], dt)
+                cmd['vel'] = vel
+                if not self._check_progress(cmd, now, abs(cmd['turned']), abs(vel) > 0.05,
+                                            scale=1.0):
+                    return self.step(now)
+                return (0.0, vel)
+            # velocity
+            if elapsed >= cmd['target']:
+                self._end('SUCCEEDED', 'ran %.1f s' % elapsed)
+                return self.step(now)
+            vel = self._ramp(cmd['vel'], cmd['v'], p['acc_linear'], dt)
+            cmd['vel'] = vel
+            wv = self._ramp(cmd.get('wvel', 0.0), cmd['w'], p['acc_angular'], dt)
+            cmd['wvel'] = wv
+            return (vel, wv)
+
+    @staticmethod
+    def _ramp(cur, want, acc, dt):
+        step = acc * dt
+        if want > cur:
+            return min(want, cur + step)
+        return max(want, cur - step)
+
+    def _check_progress(self, cmd, now, measured, commanding, scale=1.0):
+        """Stuck: commanding motion but < 10 % of the expected movement."""
+        if not commanding:
+            cmd['progress_t'] = now
+            cmd['progress_val'] = measured
+            return True
+        window = now - cmd['progress_t']
+        if window < self.p['stuck_s']:
+            return True
+        expected = abs(cmd['vel']) * window * 0.1 * scale
+        if measured - cmd['progress_val'] < expected:
+            self._end('ABORTED', 'no progress (%.2f in %.1f s) - stuck or slipping'
+                      % (measured - cmd['progress_val'], window))
+            return False
+        cmd['progress_t'] = now
+        cmd['progress_val'] = measured
+        return True
+
+    def _guards(self, now, start=False):
+        cmd = self.cmd
+        p = self.p
+        if self.mux_active in HUMAN_INPUTS:
+            return 'human takeover (%s)' % self.mux_active
+        if not start and cmd['keepalive_s'] > 0 and now - cmd['keepalive_t'] > cmd['keepalive_s']:
+            return 'keepalive lost (%.1f s)' % (now - cmd['keepalive_t'])
+        if cmd['require_supervisor']:
+            sup = self.supervisor
+            if sup is None:
+                return 'supervisor: no status'
+            if now - sup[0] > p['supervisor_max_age']:
+                return 'supervisor: status %.1f s stale' % (now - sup[0])
+            if sup[1] != 'RUNNING':
+                return 'supervisor: %s' % sup[1]
+        if self.motor is not None and self.motor[1] is False:
+            return 'motors off'
+        if self.odom is None:
+            return 'no odometry'
+        if now - self.odom[0] > p['odom_timeout']:
+            return 'odometry %.1f s stale' % (now - self.odom[0])
+        if self.points is None:
+            return 'no lidar scan'
+        if now - self.points[0] > p['scan_timeout']:
+            return 'lidar scan %.1f s stale' % (now - self.points[0])
+        if not start and now - cmd['t0'] > cmd['max_duration_s']:
+            return 'timeout (%.0f s)' % cmd['max_duration_s']
+        why, clear = self._obstacle(cmd)
+        self.status['clearance_m'] = None if clear is None else round(clear, 2)
+        return why
+
+    def _obstacle(self, cmd):
+        """(reason or None, clearance in the direction of travel)."""
+        p = self.p
+        front, rear, half = (p['footprint_front'], p['footprint_rear'],
+                             p['footprint_half_width'])
+        pts = self.points[1]
+        kind = cmd['kind']
+        v = abs(cmd.get('vel', 0.0))
+        if kind == 'straight':
+            direction = 1.0 if cmd['target'] > 0 else -1.0
+            rotating = False
+        elif kind == 'rotate':
+            direction = 0.0
+            rotating = True
+        else:
+            direction = 0.0 if cmd['v'] == 0 else (1.0 if cmd['v'] > 0 else -1.0)
+            v = max(v, abs(cmd['v']))
+            rotating = abs(cmd['w']) > 0.3 or cmd['v'] == 0
+        clear = None
+        inside = 0
+        if direction != 0.0:
+            reach = p['stop_distance'] + v * v / (2.0 * p['acc_linear'])
+            hw = half + p['side_margin']
+            for x, y in pts:
+                if -rear <= x <= front and abs(y) <= half:
+                    inside += 1
+                    continue          # inside the robot's own box: self return
+                if abs(y) > hw:
+                    continue
+                gap = (x - front) if direction > 0 else (-rear - x)
+                if gap < 0:
+                    continue
+                if clear is None or gap < clear:
+                    clear = gap
+            if clear is not None and clear < reach:
+                return ('obstacle %s %.2f m' % ('ahead' if direction > 0 else 'behind', clear),
+                        clear)
+        if rotating:
+            radius = math.hypot(max(front, rear), half)
+            limit = radius + p['rotate_clearance']
+            rclear = None
+            for x, y in pts:
+                if -rear <= x <= front and abs(y) <= half:
+                    continue
+                d = math.hypot(x, y) - radius
+                if rclear is None or d < rclear:
+                    rclear = d
+            if rclear is not None and rclear + radius < limit:
+                return 'obstacle within turning circle (%.2f m)' % max(0.0, rclear), rclear
+            if clear is None:
+                clear = rclear
+        return None, clear
+
+    # -- state ----------------------------------------------------------------
+    def _set(self, **kv):
+        for key, val in kv.items():
+            if self.status.get(key) != val:
+                self.status[key] = val
+                self.changed = True
+
+    def _end(self, state, reason):
+        self.cmd = None
+        self.zeros_left = 3
+        self._set(state=state, reason=reason)
+
+    def take_status(self, force=False):
+        """(status dict, changed) for publishing."""
+        with self.lock:
+            changed = self.changed
+            self.changed = False
+            return dict(self.status, t=time.time()), changed or force
+
+    def running(self):
+        with self.lock:
+            return self.cmd is not None
+
+
+# ---- the ROS layer ------------------------------------------------------------
+def scan_points(msg, tf):
+    """LaserScan -> [(x, y)] in base_link via tf = (dx, dy, yaw)."""
+    dx, dy, dyaw = tf
+    c, s = math.cos(dyaw), math.sin(dyaw)
+    out = []
+    a = msg.angle_min
+    rmin = max(msg.range_min, 0.0)
+    rmax = msg.range_max
+    for r in msg.ranges:
+        if math.isfinite(r) and rmin <= r <= rmax:
+            lx, ly = r * math.cos(a), r * math.sin(a)
+            out.append((dx + c * lx - s * ly, dy + s * lx + c * ly))
+        a += msg.angle_increment
+    return out
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def main():
+    import rospy
+    from actionlib_msgs.msg import GoalID
+    from geometry_msgs.msg import Twist
+    from nav_msgs.msg import Odometry
+    from sensor_msgs.msg import LaserScan
+    from std_msgs.msg import Bool, String
+
+    rospy.init_node('drive_primitive')
+    params = dict((k, float(rospy.get_param('~' + k, v))) for k, v in DEFAULTS.items())
+    odom_topic = rospy.get_param('~odom_topic', '/odometry/odom')
+    odom_fallback = rospy.get_param('~odom_fallback_topic', '/mobile_base_controller/odom')
+    scan_topic = rospy.get_param('~scan_topic', '/rplidar/scan_filtered')
+    base_frame = rospy.get_param('~base_frame', 'base_link')
+    sup_topic = rospy.get_param('~supervisor_topic', '/vitulus_test/supervisor_status')
+    sup_caller = rospy.get_param('~supervisor_callerid', '/vitulus_test_supervisor')
+
+    cancel_pubs = [rospy.Publisher(t, GoalID, queue_size=1) for t in
+                   ('/move_base_flex/exe_path/cancel', '/move_base_flex/move_base/cancel',
+                    '/move_base_flex/recovery/cancel')]
+    smach_cancel = rospy.Publisher('/smach_goal/cancel', Bool, queue_size=1)
+
+    def cancel_nav():
+        for pub in cancel_pubs:
+            pub.publish(GoalID())
+        smach_cancel.publish(Bool(True))
+
+    drv = Driver(params, on_cancel_nav=cancel_nav, warn=rospy.logwarn)
+    out = rospy.Publisher('/drive_primitive/cmd_vel', Twist, queue_size=1, tcp_nodelay=True)
+    st_pub = rospy.Publisher('/drive_primitive/status', String, queue_size=5, latch=True)
+
+    import tf2_ros
+    buf = tf2_ros.Buffer()
+    tf2_ros.TransformListener(buf)
+    tf_cache = {}
+
+    def scan_tf(frame):
+        if frame in tf_cache:
+            return tf_cache[frame]
+        try:
+            tr = buf.lookup_transform(base_frame, frame, rospy.Time(0), rospy.Duration(0.2))
+            t = tr.transform
+            val = (t.translation.x, t.translation.y, yaw_of(t.rotation))
+            tf_cache[frame] = val
+            return val
+        except Exception as exc:  # noqa: BLE001
+            rospy.logwarn_throttle(30.0, 'drive_primitive: no TF %s -> %s (%s); '
+                                   'using identity' % (frame, base_frame, exc))
+            return (0.0, 0.0, 0.0)
+
+    last_primary = [0.0]
+
+    def odom_cb(msg, primary):
+        now = time.monotonic()
+        if primary:
+            last_primary[0] = now
+        elif now - last_primary[0] < 0.5:
+            return
+        pose = msg.pose.pose
+        drv.on_odom(pose.position.x, pose.position.y, yaw_of(pose.orientation))
+
+    rospy.Subscriber(odom_topic, Odometry, odom_cb, callback_args=True, queue_size=5)
+    if odom_fallback and odom_fallback != odom_topic:
+        rospy.Subscriber(odom_fallback, Odometry, odom_cb, callback_args=False, queue_size=5)
+    rospy.Subscriber(scan_topic, LaserScan,
+                     lambda m: drv.on_points(scan_points(m, scan_tf(m.header.frame_id))),
+                     queue_size=1)
+    rospy.Subscriber('/base/motor_power_state', Bool, lambda m: drv.on_motor(m.data), queue_size=5)
+    rospy.Subscriber('/cmd_vel_mux/active', String, lambda m: drv.on_mux_active(m.data),
+                     queue_size=5)
+    rospy.Subscriber('/cmd_vel_mux/takeover', String, lambda m: drv.on_takeover(m.data),
+                     queue_size=5)
+
+    def sup_cb(msg):
+        hdr = getattr(msg, '_connection_header', None) or {}
+        if hdr.get('callerid') not in (None, sup_caller):
+            return
+        try:
+            state = (json.loads(msg.data) or {}).get('state')
+        except ValueError:
+            state = msg.data
+        drv.on_supervisor(state)
+    rospy.Subscriber(sup_topic, String, sup_cb, queue_size=5)
+    rospy.Subscriber('/drive_primitive/stop', Bool, lambda m: drv.on_stop(bool(m.data)),
+                     queue_size=5)
+    rospy.Subscriber('/drive_primitive/keepalive', String, lambda m: drv.on_keepalive(m.data),
+                     queue_size=20)
+
+    def command_cb(msg):
+        st = drv.command(msg.data)
+        rospy.loginfo('drive_primitive: %s %s %s', st.get('id'), st.get('state'),
+                      st.get('reason') or '')
+    rospy.Subscriber('/drive_primitive/command', String, command_cb, queue_size=5)
+
+    tick = [0]
+    last_state = ['IDLE']
+
+    def loop(_evt):
+        res = drv.step()
+        if res is not None:
+            tw = Twist()
+            tw.linear.x, tw.angular.z = res
+            out.publish(tw)
+        tick[0] += 1
+        st, changed = drv.take_status(force=tick[0] % 10 == 0)
+        if changed:
+            st_pub.publish(String(json.dumps(st, sort_keys=True)))
+            if st['state'] != last_state[0]:
+                last_state[0] = st['state']
+                if st['state'] in ('ABORTED', 'REJECTED'):
+                    rospy.logwarn('drive_primitive: %s %s: %s', st.get('id'), st['state'],
+                                  st.get('reason'))
+                elif st['state'] == 'SUCCEEDED':
+                    rospy.loginfo('drive_primitive: %s SUCCEEDED: %s', st.get('id'),
+                                  st.get('reason'))
+    rospy.Timer(rospy.Duration(1.0 / params['rate_hz']), loop)
+    rospy.loginfo('drive_primitive: ready (%s, %s -> /drive_primitive/cmd_vel)',
+                  odom_topic, scan_topic)
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

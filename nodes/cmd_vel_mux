@@ -7,6 +7,9 @@ the diff_drive controller's own topic) and decides which one by priority:
 
     ds4     /ds4/cmd_vel       the DS4 gamepad (ds4_twist)              human
     teleop  /teleop/cmd_vel    the web UI joystick (rosbridge), keyboard human
+    primitive /drive_primitive/cmd_vel  closed-loop direct drive (vitulus_base
+                               drive_primitive: straight / rotate / short
+                               velocity, used by the agent)              software
     nav     /cmd_vel           all software: move_base_flex, docking,
                                mower recovery, agent supervisor ...     software
 
@@ -33,12 +36,21 @@ Rules
     blocked - only that node - until it has been quiet (no non-zero command)
     for `~rearm_quiet_s`.  A node that obeyed the cancel, or a new one, drives
     normally on its next goal (someone presses Go).
+  * Between software inputs the higher priority wins while it is talking: an
+    input that published anything (zeros included) within `~software_hold_s`
+    (0.5 s) owns the wheels and every lower software input is dropped (a
+    dropped NON-zero command is listed in nav_blocked).  So the closed-loop
+    drive_primitive beats MBF/docking on /cmd_vel, and its final zeros hold
+    the robot still; 0.5 s after it falls silent /cmd_vel drives again.  The
+    human inputs still beat everything, primitive included; a takeover also
+    sends True on /drive_primitive/stop.  Without anything on
+    /drive_primitive/cmd_vel the mux behaves exactly as before.
   * The node forwards each message as it arrives and never repeats one; when the
     chosen input stops, the controller's cmd_vel_timeout (0.25 s) stops the
     wheels.  When this node is down nothing reaches the base: the robot stands.
 
-Status: /cmd_vel_mux/active (std_msgs/String, latched: ds4 | teleop | nav |
-nav_blocked), /cmd_vel_mux/status (JSON, latched, on change + 1 Hz),
+Status: /cmd_vel_mux/active (std_msgs/String, latched: ds4 | teleop |
+primitive | nav | nav_blocked), /cmd_vel_mux/status (JSON, latched, on change + 1 Hz),
 /cmd_vel_mux/takeover (std_msgs/String, one message per takeover).
 """
 import json
@@ -53,12 +65,15 @@ from std_msgs.msg import Bool, String
 DEFAULT_INPUTS = [
     {'name': 'ds4', 'topic': '/ds4/cmd_vel', 'priority': 100, 'human': True},
     {'name': 'teleop', 'topic': '/teleop/cmd_vel', 'priority': 90, 'human': True},
+    {'name': 'primitive', 'topic': '/drive_primitive/cmd_vel', 'priority': 50,
+     'human': False},
     {'name': 'nav', 'topic': '/cmd_vel', 'priority': 10, 'human': False},
 ]
 DEFAULT_GOAL_CANCELS = ['/move_base_flex/exe_path/cancel',
                         '/move_base_flex/move_base/cancel',
                         '/move_base_flex/recovery/cancel']
-DEFAULT_STOPS = ['/smach_goal/cancel', '/dock_smach/stop', '/mower_smach/stop']
+DEFAULT_STOPS = ['/smach_goal/cancel', '/dock_smach/stop', '/mower_smach/stop',
+                 '/drive_primitive/stop']
 # Stops that make sense only while a mowing program runs (see the docstring).
 DEFAULT_PROGRAM_STOPS = ['/mower_smach/stop']
 DEFAULT_TAKEOVER_BUTTONS = ['button_ps', 'button_l1', 'button_r1']
@@ -77,6 +92,9 @@ class Mux(object):
         self.dz_ang = float(rospy.get_param('~deadzone_angular', 0.05))
         self.hold_s = float(rospy.get_param('~hold_s', 1.5))
         self.rearm_quiet_s = float(rospy.get_param('~rearm_quiet_s', 1.0))
+        self.software_hold_s = float(rospy.get_param('~software_hold_s', 0.5))
+        self.sw_dropped = {}             # callerid -> monotonic of a non-zero cmd dropped for a higher software input
+        self.sw_last_msg = {}            # software input name -> monotonic of its last forwardable msg
         self.cancel_on_takeover = bool(rospy.get_param('~cancel_on_takeover', True))
         self.inputs = list(rospy.get_param('~inputs', DEFAULT_INPUTS))
         goal_cancels = list(rospy.get_param('~goal_cancel_topics', DEFAULT_GOAL_CANCELS))
@@ -159,6 +177,19 @@ class Mux(object):
                     best = inp
         return best
 
+    def _software_owner(self, now):
+        """The highest-priority software input that talked within
+        software_hold_s, or None."""
+        best = None
+        for inp in self.inputs:
+            if inp.get('human'):
+                continue
+            t = self.sw_last_msg.get(inp['name'])
+            if t is not None and now - t <= self.software_hold_s:
+                if best is None or int(inp['priority']) > int(best['priority']):
+                    best = inp
+        return best
+
     def _start_takeover(self, source, now):
         self.takeover_active = True
         self.takeover_count += 1
@@ -198,6 +229,14 @@ class Mux(object):
                 moving = deflected(msg, self.dz_lin, self.dz_ang)
                 self._update_rearm(now)
                 forward = self._human_owner(now) is None and self._nav_admit(caller, now)
+                if forward:
+                    owner = self._software_owner(now)
+                    if owner is not None and int(owner['priority']) > int(inp['priority']):
+                        forward = False      # a higher software input is driving
+                        if moving:
+                            self.sw_dropped[caller] = now
+                    else:
+                        self.sw_last_msg[inp['name']] = now
                 if moving:
                     self.nav_last_nonzero[caller] = now
                     if not forward:
@@ -249,14 +288,21 @@ class Mux(object):
         return False
 
     def _blocked_callers(self, now):
-        return sorted(c for c, t in self.nav_blocked_now.items()
-                      if now - t < 2.0 and c not in self.nav_admitted)
+        out = set(c for c, t in self.nav_blocked_now.items()
+                  if now - t < 2.0 and c not in self.nav_admitted)
+        out.update(c for c, t in self.sw_dropped.items()
+                   if now - t < self.software_hold_s + 0.1)
+        return sorted(out)
 
     # -- status -------------------------------------------------------------
     def _state(self, now):
         owner = self._human_owner(now)
         if owner is not None:
             return owner['name']
+        sw = self._software_owner(now)
+        if sw is not None and sw['name'] != 'nav' and int(sw['priority']) > min(
+                int(i['priority']) for i in self.inputs if not i.get('human')):
+            return sw['name']
         if self._blocked_callers(now):
             return 'nav_blocked'
         return 'nav'
