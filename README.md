@@ -21,8 +21,10 @@ A human input counts only when deflected (dead zone `~deadzone_linear` 0.02 m/s,
 (`~takeover_buttons`, read from `/ds4/status`) — the zeros a switched-on DS4
 sends with centred sticks never block the software. The first deflection is a
 takeover: the software's goals are cancelled once (`/move_base_flex/{exe_path,
-move_base,recovery}/cancel`, `/smach_goal/cancel`, `/dock_smach/stop`,
-`/mower_smach/stop`) and `/cmd_vel_mux/takeover` names the source. The human
+move_base,recovery}/cancel`, `/smach_goal/cancel`, `/dock_smach/stop`, and
+`/mower_smach/stop` while a mowing program runs — skipped only when
+`/mower_smach/busy` is false and `/mower_smach/active_program` empty, unknown
+counts as running) and `/cmd_vel_mux/takeover` names the source. The human
 keeps the wheels `~hold_s` (1.5 s) after the last deflection (released sticks =
 zeros = stop); the software is accepted again only after it has been quiet for
 `~rearm_quiet_s` (1 s), so nothing drives on by itself. Drive motors are never

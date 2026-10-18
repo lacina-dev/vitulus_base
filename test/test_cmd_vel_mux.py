@@ -18,6 +18,7 @@ Cases
   5b Go right after release (obeyed node)  -> passes at once
   6  DS4 PS button                         -> takeover without moving a stick
   7  web joystick vs DS4                   -> DS4 ranks higher; web alone wins over nav
+  9  mower_smach idle / mowing             -> /mower_smach/stop only while mowing
   8  mux stopped                           -> nothing reaches the base
 """
 import json
@@ -77,6 +78,8 @@ def main():
             rospy.Subscriber(t, GoalID, rec(cancels), queue_size=100)
         for t in ('/smach_goal/cancel', '/dock_smach/stop', '/mower_smach/stop'):
             rospy.Subscriber(t, Bool, rec(stops), queue_size=100)
+        mower_stops = []
+        rospy.Subscriber('/mower_smach/stop', Bool, rec(mower_stops), queue_size=100)
         rospy.Subscriber('/cmd_vel_mux/takeover', String, rec(takeovers), queue_size=100)
         rospy.Subscriber('/cmd_vel_mux/status', String,
                          lambda m: status.append(json.loads(m.data)), queue_size=100)
@@ -248,6 +251,37 @@ def main():
         drive['ds4'] = 0.0
         drive['web'] = None
         drive['nav'] = None
+        time.sleep(3.0)
+
+        print('9  mower_smach idle (busy false, no program) -> no /mower_smach/stop')
+        busy_pub = rospy.Publisher('/mower_smach/busy', Bool, queue_size=1, latch=True)
+        prog_pub = rospy.Publisher('/mower_smach/active_program', String, queue_size=1,
+                                   latch=True)
+        busy_pub.publish(Bool(False))
+        prog_pub.publish(String(' '))
+        time.sleep(1.5)
+        with lk:
+            m0 = len(mower_stops)
+        drive['ds4'] = 0.4
+        o, c, s, t = window(1.0)
+        drive['ds4'] = 0.0
+        with lk:
+            m1 = len(mower_stops)
+        ok('idle mower: takeover still cancels goals and stops dock/smach_goal',
+           len(c) == 3 and len(s) == 2 and len(t) == 1, '%d %d %d' % (len(c), len(s), len(t)))
+        ok('idle mower: no /mower_smach/stop', m1 == m0, m1 - m0)
+        time.sleep(3.0)
+        print('9b mowing program running -> /mower_smach/stop at once')
+        busy_pub.publish(Bool(True))
+        prog_pub.publish(String('garden'))
+        time.sleep(1.0)
+        drive['ds4'] = 0.4
+        o, c, s, t = window(1.0)
+        drive['ds4'] = 0.0
+        with lk:
+            m2 = len(mower_stops)
+        ok('program running: 3 stops incl. /mower_smach/stop', len(s) == 3 and m2 == m1 + 1,
+           '%d %d' % (len(s), m2 - m1))
         time.sleep(3.0)
 
         print('8  mux stopped -> nothing reaches the base')

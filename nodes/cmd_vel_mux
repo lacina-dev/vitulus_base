@@ -17,8 +17,14 @@ Rules
     zeros are dropped, so a gamepad lying on the table never blocks autonomy.
   * The first deflection starts a TAKEOVER: the software's goals are cancelled
     once (MBF exe_path / move_base / recovery, /smach_goal/cancel,
-    /dock_smach/stop, /mower_smach/stop), /cmd_vel_mux/takeover names the
-    source.  Drive motors are never switched off here.
+    /dock_smach/stop, and /mower_smach/stop while a mowing program runs),
+    /cmd_vel_mux/takeover names the source.  Drive motors are never switched
+    off here.
+  * /mower_smach/stop is skipped only when mower_smach says it is idle
+    (/mower_smach/busy false and /mower_smach/active_program empty); unknown
+    counts as running, so the stop is sent.  A stop sent to an idle mower
+    used to queue up behind its blocking blade shutdown and cancel a later
+    docking (18. 10. 2026).
   * During the takeover and `~hold_s` after the last deflection the human input
     owns the wheels - its zeros (sticks released) are forwarded, the software
     is dropped.
@@ -53,6 +59,8 @@ DEFAULT_GOAL_CANCELS = ['/move_base_flex/exe_path/cancel',
                         '/move_base_flex/move_base/cancel',
                         '/move_base_flex/recovery/cancel']
 DEFAULT_STOPS = ['/smach_goal/cancel', '/dock_smach/stop', '/mower_smach/stop']
+# Stops that make sense only while a mowing program runs (see the docstring).
+DEFAULT_PROGRAM_STOPS = ['/mower_smach/stop']
 DEFAULT_TAKEOVER_BUTTONS = ['button_ps', 'button_l1', 'button_r1']
 
 
@@ -81,7 +89,18 @@ class Mux(object):
         self.pub_status = rospy.Publisher('~status', String, queue_size=1, latch=True)
         self.pub_takeover = rospy.Publisher('~takeover', String, queue_size=5)
         self.goal_cancel_pubs = [rospy.Publisher(t, GoalID, queue_size=1) for t in goal_cancels]
+        program_stops = set(rospy.get_param('~program_stop_topics', DEFAULT_PROGRAM_STOPS))
         self.stop_pubs = [rospy.Publisher(t, Bool, queue_size=1) for t in stops]
+        self.stop_program_only = [rospy.resolve_name(t) in
+                                  {rospy.resolve_name(x) for x in program_stops}
+                                  for t in stops]
+        self.mower_busy = None           # /mower_smach/busy; None = unknown
+        self.mower_program = None        # /mower_smach/active_program
+        rospy.Subscriber(rospy.get_param('~mower_busy_topic', '/mower_smach/busy'),
+                         Bool, self._mower_busy, queue_size=1)
+        rospy.Subscriber(rospy.get_param('~mower_program_topic',
+                                         '/mower_smach/active_program'),
+                         String, self._mower_program, queue_size=1)
 
         self.human_last_deflect = {}     # name -> monotonic of the last deflected msg
         self.takeover_active = False
@@ -112,6 +131,21 @@ class Mux(object):
                       ', '.join('%s %s' % (i['name'], i['topic']) for i in self.inputs),
                       self.out.resolved_name, self.hold_s, self.rearm_quiet_s)
 
+    def _mower_busy(self, msg):
+        with self.lock:
+            self.mower_busy = bool(msg.data)
+
+    def _mower_program(self, msg):
+        with self.lock:
+            self.mower_program = (msg.data or '').strip()
+
+    def mower_program_running(self):
+        """False only when mower_smach is known idle; unknown -> True."""
+        with self.lock:
+            if self.mower_busy is None:
+                return True
+            return bool(self.mower_busy) or bool(self.mower_program)
+
     # -- decisions ----------------------------------------------------------
     def _human_owner(self, now):
         """The highest-priority human input deflected within hold_s, or None."""
@@ -137,7 +171,10 @@ class Mux(object):
         if self.cancel_on_takeover:
             for p in self.goal_cancel_pubs:
                 p.publish(GoalID())
-            for p in self.stop_pubs:
+            mowing = self.mower_program_running()
+            for p, program_only in zip(self.stop_pubs, self.stop_program_only):
+                if program_only and not mowing:
+                    continue
                 p.publish(Bool(True))
 
     def _human_touch(self, name, now):
