@@ -38,6 +38,8 @@ import moteus
 import threading
 import sys
 import signal
+import os
+import rospy.core
 from std_msgs.msg import Float32, Bool, String
 from vitulus_msgs.msg import Moteus_controller_state, Power_status
 import traceback
@@ -243,6 +245,54 @@ class BaseController:
         self.pub_rear_left_state = rospy.Publisher("/base/rear_left_wheel_state", Moteus_controller_state, queue_size=10)
         self.pub_rear_right_state = rospy.Publisher("/base/rear_right_wheel_state", Moteus_controller_state, queue_size=10)
         self.timer_slow = None
+        # Node shutdown (rosnode kill, SIGINT, SIGTERM, ROS thread end). Both the
+        # asyncio loop and the ROS thread watch it so the process really exits and
+        # roslaunch can respawn it.
+        self.shutdown_event = threading.Event()
+        self.SHUTDOWN_HARD_EXIT_S = 3.0
+
+    def should_exit(self):
+        return self.shutdown_event.is_set() or rospy.is_shutdown()
+
+    def request_shutdown(self, reason):
+        """Idempotent; safe from any thread / signal handler. Never powers anything ON."""
+        if self.shutdown_event.is_set():
+            return
+        self.shutdown_event.set()
+        try:
+            rospy.loginfo("Node base_controller shutting down (%s)..." % reason)
+        except Exception:
+            pass
+        # Last resort: if something blocks synchronously, do not hang forever
+        # (motor drivers have a 0.5 s watchdog, power module output is commanded OFF).
+        def hard_exit():
+            time.sleep(self.SHUTDOWN_HARD_EXIT_S)
+            sys.stderr.write("base_controller: shutdown timed out, forcing exit\n")
+            sys.stderr.flush()
+            os._exit(1)
+        threading.Thread(target=hard_exit, name="shutdown_watchdog", daemon=True).start()
+
+    def publish_motor_switch_off(self):
+        """Best effort: command the power module motor output OFF."""
+        pub = self.motors_switch_pub
+        if pub is None:
+            return
+        try:
+            pub.publish(Bool(data=False))
+            time.sleep(0.2)  # let the publisher thread flush before topics close
+        except Exception as e:
+            sys.stderr.write("base_controller: motor power OFF publish failed: %s\n" % e)
+
+    async def stop_motors(self, timeout=0.3):
+        """Best effort set_stop on every drive, bounded so it cannot block exit."""
+        for config in self.motor_configs:
+            c = config['obj'].c
+            if not c:
+                continue
+            try:
+                await asyncio.wait_for(c.set_stop(), timeout)
+            except Exception as e:
+                sys.stderr.write("base_controller: stop motor %s failed: %r\n" % (config['name'], e))
 
     async def run(self):
         ## Run Moteus controller
@@ -251,7 +301,9 @@ class BaseController:
         wait_int_counter = 0
         wait_int_nr = 10
         while not self.ros_ready:
-            time.sleep(0.3)
+            if self.should_exit():
+                return
+            await asyncio.sleep(0.3)
             # Motors may legitimately stay OFF here for a long time (boot default).
             # Only nag the power module while a power-on was really requested.
             if not self.power_on_pending:
@@ -271,7 +323,7 @@ class BaseController:
                 await config['obj'].c.set_stop()
 
         start_time = time.time()
-        while True:
+        while not self.should_exit():
 
             if self.stop_controller:
                 if self.controller_status:
@@ -357,6 +409,10 @@ class BaseController:
                         rospy.logerr(f"Error commanding/querying motor {motor_obj.id} ({config['name']}): {e}")
             
             await asyncio.sleep(0.01)
+
+        # Leaving on shutdown: drives to stop (power output is commanded OFF by the
+        # pre-shutdown hook). Nothing is enabled here.
+        await self.stop_motors()
 
     def publish_velocity(self):
         ## Publish controllers velocities
@@ -466,11 +522,32 @@ async def main():
 
     # Start ROS in a thread separate from the asyncio one.
     def start_ros():
+        try:
+            ros_loop()
+        except rospy.ROSInterruptException:
+            pass
+        except Exception:
+            traceback.print_exc()
+            rospy.logerr("base_controller ROS thread failed!")
+        finally:
+            # Whatever ended the ROS side (rosnode kill, signal, crash) ends the node.
+            controller.request_shutdown("ROS thread finished")
+            if not rospy.is_shutdown():
+                rospy.signal_shutdown("ROS thread finished")
+
+    def ros_loop():
         # Publisher to motor switch on the power module and subscriber for motor switch check.
         controller.motors_switch_pub = rospy.Publisher("/pm/set_motor_switch", Bool, queue_size=10)
         controller.motors_power_switch = rospy.Subscriber('/pm/power_status', Power_status, controller.callback_power_status)
 
         rospy.init_node('base_controller', disable_signals=True)
+
+        # rosnode kill / signal_shutdown: runs before topics close, so the OFF still
+        # reaches the power module; also wakes the asyncio loop (exit + respawn).
+        def on_preshutdown(reason):
+            controller.request_shutdown(reason)
+            controller.publish_motor_switch_off()
+        rospy.core.add_preshutdown_hook(on_preshutdown)
         rospy.Subscriber('/base/front_left_wheel_vel', Float32, controller.callback_front_left_vel)
         rospy.Subscriber('/base/front_right_wheel_vel', Float32, controller.callback_front_right_vel)
         rospy.Subscriber('/base/rear_left_wheel_vel', Float32, controller.callback_rear_left_vel)
@@ -500,7 +577,7 @@ async def main():
         slow_counter = 0
         slow_limit = rate/2 ## 2x per second ToDo: refactor to timer
         rospy.loginfo("Moteus controller initialized.")
-        while not rospy.is_shutdown():
+        while not controller.should_exit():
 
             ## Turn off the motor switch in power module
             if controller.stop_power:
@@ -542,8 +619,10 @@ async def main():
                 new_msg.data = True
                 controller.motors_switch_pub.publish(new_msg)
                 rospy.loginfo("Wait for Power module enable motor power output...")
-                while not controller.motors_switch:
-                    rospy.sleep(0.3)
+                while not controller.motors_switch and not controller.should_exit():
+                    time.sleep(0.3)
+                if controller.should_exit():
+                    break
                 rospy.loginfo("Motor power output enabled.")
 
                 controller.power_on_pending = False
@@ -608,28 +687,44 @@ async def main():
 
             r.sleep()
 
-    ros_thread = threading.Thread(target=start_ros)
+    ros_thread = threading.Thread(target=start_ros, name="ros_loop", daemon=True)
     ros_thread.start()
 
-    def signal_handler(event, handl):
-        new_msg = Bool()
-        new_msg.data = False
-        controller.motors_switch_pub.publish(new_msg)
-        rospy.loginfo("Node base_controller shutting down...")
-        rospy.signal_shutdown("end")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
+    # SIGINT/SIGTERM (rospy signals are disabled): only flag the shutdown here, the
+    # actual ROS shutdown (incl. motor power OFF) runs outside the signal context.
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, controller.request_shutdown, signal.Signals(sig).name)
 
     # Run Moteus in asyncio
-    try:
-        await controller.run()
-    except Exception as e:
+    run_task = asyncio.ensure_future(controller.run())
+    failed = False
+    while not run_task.done() and not controller.should_exit():
+        await asyncio.sleep(0.05)
+    if not run_task.done():
+        # run() sees the flag within one cycle; cancel if it does not finish in time.
+        done, _ = await asyncio.wait({run_task}, timeout=1.0)
+        if not done:
+            run_task.cancel()
+            await asyncio.wait({run_task}, timeout=0.3)
+            await controller.stop_motors(timeout=0.1)
+    if run_task.done() and not run_task.cancelled() and run_task.exception() is not None:
+        e = run_task.exception()
         print(e)
-        traceback.print_exc()
+        traceback.print_exception(type(e), e, e.__traceback__)
         rospy.logerr("Moteus controller failed!")
-        signal_handler("", "")
+        failed = True
+
+    controller.request_shutdown("controller loop finished")
+    if not rospy.is_shutdown():
+        # Runs the pre-shutdown hook -> motor power OFF; off the loop thread so a
+        # slow rospy teardown cannot stall us beyond the hard-exit watchdog.
+        sd = threading.Thread(target=rospy.signal_shutdown, args=("end",), daemon=True)
+        sd.start()
+        sd.join(1.0)
+    ros_thread.join(1.0)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
