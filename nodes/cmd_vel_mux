@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""cmd_vel_mux - a person on the controls always beats the software.
+
+Every velocity command for the wheels goes through this node.  It forwards
+exactly one input to the base (`~output`, default /mobile_base_controller/cmd_vel,
+the diff_drive controller's own topic) and decides which one by priority:
+
+    ds4     /ds4/cmd_vel       the DS4 gamepad (ds4_twist)              human
+    teleop  /teleop/cmd_vel    the web UI joystick (rosbridge), keyboard human
+    nav     /cmd_vel           all software: move_base_flex, docking,
+                               mower recovery, agent supervisor ...     software
+
+Rules
+  * A human input counts only while it is really *deflected*: |linear.x| or
+    |angular.z| over the dead zone, or (DS4) a takeover button pressed.  A
+    switched-on DS4 publishes zeros at ~250 Hz with centred sticks - those
+    zeros are dropped, so a gamepad lying on the table never blocks autonomy.
+  * The first deflection starts a TAKEOVER: the software's goals are cancelled
+    once (MBF exe_path / move_base / recovery, /smach_goal/cancel,
+    /dock_smach/stop, /mower_smach/stop), /cmd_vel_mux/takeover names the
+    source.  Drive motors are never switched off here.
+  * During the takeover and `~hold_s` after the last deflection the human input
+    owns the wheels - its zeros (sticks released) are forwarded, the software
+    is dropped.
+  * After that a software publisher (told apart by its callerid) that was
+    still commanding when the person let go has ignored the cancel: it stays
+    blocked - only that node - until it has been quiet (no non-zero command)
+    for `~rearm_quiet_s`.  A node that obeyed the cancel, or a new one, drives
+    normally on its next goal (someone presses Go).
+  * The node forwards each message as it arrives and never repeats one; when the
+    chosen input stops, the controller's cmd_vel_timeout (0.25 s) stops the
+    wheels.  When this node is down nothing reaches the base: the robot stands.
+
+Status: /cmd_vel_mux/active (std_msgs/String, latched: ds4 | teleop | nav |
+nav_blocked), /cmd_vel_mux/status (JSON, latched, on change + 1 Hz),
+/cmd_vel_mux/takeover (std_msgs/String, one message per takeover).
+"""
+import json
+import threading
+import time
+
+import rospy
+from actionlib_msgs.msg import GoalID
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Bool, String
+
+DEFAULT_INPUTS = [
+    {'name': 'ds4', 'topic': '/ds4/cmd_vel', 'priority': 100, 'human': True},
+    {'name': 'teleop', 'topic': '/teleop/cmd_vel', 'priority': 90, 'human': True},
+    {'name': 'nav', 'topic': '/cmd_vel', 'priority': 10, 'human': False},
+]
+DEFAULT_GOAL_CANCELS = ['/move_base_flex/exe_path/cancel',
+                        '/move_base_flex/move_base/cancel',
+                        '/move_base_flex/recovery/cancel']
+DEFAULT_STOPS = ['/smach_goal/cancel', '/dock_smach/stop', '/mower_smach/stop']
+DEFAULT_TAKEOVER_BUTTONS = ['button_ps', 'button_l1', 'button_r1']
+
+
+def deflected(msg, dz_lin, dz_ang):
+    return (abs(msg.linear.x) > dz_lin or abs(msg.linear.y) > dz_lin
+            or abs(msg.angular.z) > dz_ang)
+
+
+class Mux(object):
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.lock = threading.RLock()
+        self.dz_lin = float(rospy.get_param('~deadzone_linear', 0.02))
+        self.dz_ang = float(rospy.get_param('~deadzone_angular', 0.05))
+        self.hold_s = float(rospy.get_param('~hold_s', 1.5))
+        self.rearm_quiet_s = float(rospy.get_param('~rearm_quiet_s', 1.0))
+        self.cancel_on_takeover = bool(rospy.get_param('~cancel_on_takeover', True))
+        self.inputs = list(rospy.get_param('~inputs', DEFAULT_INPUTS))
+        goal_cancels = list(rospy.get_param('~goal_cancel_topics', DEFAULT_GOAL_CANCELS))
+        stops = list(rospy.get_param('~stop_topics', DEFAULT_STOPS))
+        self.buttons = list(rospy.get_param('~takeover_buttons', DEFAULT_TAKEOVER_BUTTONS))
+
+        self.out = rospy.Publisher(rospy.get_param('~output', '/mobile_base_controller/cmd_vel'),
+                                   Twist, queue_size=1, tcp_nodelay=True)
+        self.pub_active = rospy.Publisher('~active', String, queue_size=1, latch=True)
+        self.pub_status = rospy.Publisher('~status', String, queue_size=1, latch=True)
+        self.pub_takeover = rospy.Publisher('~takeover', String, queue_size=5)
+        self.goal_cancel_pubs = [rospy.Publisher(t, GoalID, queue_size=1) for t in goal_cancels]
+        self.stop_pubs = [rospy.Publisher(t, Bool, queue_size=1) for t in stops]
+
+        self.human_last_deflect = {}     # name -> monotonic of the last deflected msg
+        self.takeover_active = False
+        self.takeover_count = 0
+        self.last_takeover = None        # {'source', 't'}
+        self.session_end = None          # monotonic end of the last human session
+        self.nav_last_nonzero = {}       # callerid -> monotonic of its last non-zero cmd
+        self.nav_admitted = set()        # callers let back after the last takeover
+        self.nav_blocked_now = {}        # callerid -> monotonic of a dropped non-zero cmd
+        self.last_forwarded = None       # name of the input forwarded last
+        self.active = None
+        self.prev_buttons = {}
+
+        for inp in sorted(self.inputs, key=lambda i: -int(i['priority'])):
+            rospy.Subscriber(inp['topic'], Twist, self._cb, callback_args=inp,
+                             queue_size=1, tcp_nodelay=True)
+        ds4_status = rospy.get_param('~ds4_status_topic', '/ds4/status')
+        if ds4_status and self.buttons:
+            try:
+                from ds4_driver.msg import Status
+                rospy.Subscriber(ds4_status, Status, self._ds4_status, queue_size=1)
+            except ImportError:
+                rospy.logwarn('cmd_vel_mux: ds4_driver not available - takeover by '
+                              'button off, sticks still take over')
+        self._publish_status(force=True)
+        rospy.Timer(rospy.Duration(0.1), self._tick)
+        rospy.loginfo('cmd_vel_mux: %s -> %s (hold %.1f s, rearm after %.1f s quiet)',
+                      ', '.join('%s %s' % (i['name'], i['topic']) for i in self.inputs),
+                      self.out.resolved_name, self.hold_s, self.rearm_quiet_s)
+
+    # -- decisions ----------------------------------------------------------
+    def _human_owner(self, now):
+        """The highest-priority human input deflected within hold_s, or None."""
+        best = None
+        for inp in self.inputs:
+            if not inp.get('human'):
+                continue
+            t = self.human_last_deflect.get(inp['name'])
+            if t is not None and now - t <= self.hold_s:
+                if best is None or int(inp['priority']) > int(best['priority']):
+                    best = inp
+        return best
+
+    def _start_takeover(self, source, now):
+        self.takeover_active = True
+        self.takeover_count += 1
+        self.last_takeover = {'source': source, 't': rospy.get_time()}
+        self.session_end = None
+        self.nav_admitted = set()
+        rospy.logwarn('cmd_vel_mux: human takeover by %s - software goals cancelled, '
+                      'software blocked until released', source)
+        self.pub_takeover.publish(String(source))
+        if self.cancel_on_takeover:
+            for p in self.goal_cancel_pubs:
+                p.publish(GoalID())
+            for p in self.stop_pubs:
+                p.publish(Bool(True))
+
+    def _human_touch(self, name, now):
+        with self.lock:
+            if self._human_owner(now) is None:
+                self._start_takeover(name, now)
+            self.human_last_deflect[name] = now
+
+    def _cb(self, msg, inp):
+        now = self.clock()
+        forward = False
+        with self.lock:
+            if inp.get('human'):
+                if deflected(msg, self.dz_lin, self.dz_ang):
+                    self._human_touch(inp['name'], now)
+                owner = self._human_owner(now)
+                forward = owner is not None and owner['name'] == inp['name']
+            else:
+                hdr = getattr(msg, '_connection_header', None) or {}
+                caller = hdr.get('callerid', '?')
+                moving = deflected(msg, self.dz_lin, self.dz_ang)
+                self._update_rearm(now)
+                forward = self._human_owner(now) is None and self._nav_admit(caller, now)
+                if moving:
+                    self.nav_last_nonzero[caller] = now
+                    if not forward:
+                        self.nav_blocked_now[caller] = now
+            if forward:
+                self.last_forwarded = inp['name']
+        if forward:
+            self.out.publish(msg)
+
+    def _ds4_status(self, msg):
+        now = self.clock()
+        pressed = False
+        for b in self.buttons:
+            v = int(getattr(msg, b, 0) or 0)
+            if v and not self.prev_buttons.get(b):
+                pressed = True
+            self.prev_buttons[b] = v
+        if pressed:
+            self._human_touch('ds4', now)
+            self.out.publish(Twist())   # the button means "stand": stop at once
+
+    def _update_rearm(self, now):
+        if self._human_owner(now) is not None:
+            return
+        if self.takeover_active:
+            self.takeover_active = False
+            self.session_end = max(self.human_last_deflect.values()) + self.hold_s
+            rospy.loginfo('cmd_vel_mux: human released the controls')
+
+    def _nav_admit(self, caller, now):
+        """May this software publisher drive?  Always, unless a takeover
+        happened and it has not yet been quiet for rearm_quiet_s since."""
+        if self.takeover_count == 0 or caller in self.nav_admitted:
+            return True
+        if self.session_end is None:
+            return False                        # the human still has it
+        # Quiet = no non-zero command for rearm_quiet_s, either already before
+        # the person let go (it obeyed the cancel: a new goal from it is a new
+        # goal) or since.  A node still commanding when the person let go has
+        # ignored the cancel and waits until it falls silent.
+        last = self.nav_last_nonzero.get(caller)
+        if (last is None or last <= self.session_end - self.rearm_quiet_s
+                or now - last >= self.rearm_quiet_s):
+            self.nav_admitted.add(caller)
+            self.nav_blocked_now.pop(caller, None)
+            rospy.loginfo('cmd_vel_mux: %s quiet for %.1f s after the takeover - accepted',
+                          caller, self.rearm_quiet_s)
+            return True
+        return False
+
+    def _blocked_callers(self, now):
+        return sorted(c for c, t in self.nav_blocked_now.items()
+                      if now - t < 2.0 and c not in self.nav_admitted)
+
+    # -- status -------------------------------------------------------------
+    def _state(self, now):
+        owner = self._human_owner(now)
+        if owner is not None:
+            return owner['name']
+        if self._blocked_callers(now):
+            return 'nav_blocked'
+        return 'nav'
+
+    def _tick(self, _evt):
+        with self.lock:
+            self._update_rearm(self.clock())
+        self._publish_status()
+
+    def _publish_status(self, force=False):
+        now = self.clock()
+        with self.lock:
+            state = self._state(now)
+            changed = state != self.active
+            self.active = state
+            st = {'active': state, 'takeover': self.takeover_active,
+                  'nav_blocked': self._blocked_callers(now),
+                  'takeovers': self.takeover_count,
+                  'last_takeover': self.last_takeover, 'hold_s': self.hold_s,
+                  'rearm_quiet_s': self.rearm_quiet_s}
+        if changed or force:
+            self.pub_active.publish(String(state))
+        self._status_n = getattr(self, '_status_n', 0) + 1
+        if changed or force or self._status_n % 10 == 0:
+            self.pub_status.publish(String(json.dumps(st, sort_keys=True)))
+
+
+def main():
+    rospy.init_node('cmd_vel_mux')
+    Mux()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

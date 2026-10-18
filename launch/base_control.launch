@@ -10,9 +10,20 @@
 	<!-- Vitulus model -->
 	<param name="robot_description" command="$(find xacro)/xacro '$(find vitulus_description)/urdf/vitulus4WD_description.urdf.xacro' --inorder" />
 
+    <!-- cmd_vel_mux (18. 10. 2026): a person on the controls beats the software.
+         The diff_drive controller listens on its own /mobile_base_controller/cmd_vel
+         and ONLY the mux publishes there: DS4 (/ds4/cmd_vel) > web joystick / keyboard
+         (/teleop/cmd_vel) > all software (/cmd_vel: MBF, docking, mower recovery,
+         agent supervisor). A deflected stick cancels the software's goals once;
+         centred-stick zeros never block the software. See nodes/cmd_vel_mux.
+         If the mux is not running nothing reaches the wheels - the robot stands.
+         cmd_vel_mux:=false = the old behaviour (everything straight on /cmd_vel). -->
+    <arg name="cmd_vel_mux" default="true"/>
     <node name="vitulus_base_node" pkg="vitulus_base" type="vitulus_base_node">
-        <remap from="/mobile_base_controller/cmd_vel" to="/cmd_vel" />
+        <remap from="/mobile_base_controller/cmd_vel" to="/cmd_vel" unless="$(arg cmd_vel_mux)"/>
     </node>
+    <node name="cmd_vel_mux" pkg="vitulus_base" type="cmd_vel_mux" output="screen"
+          respawn="true" respawn_delay="1" if="$(arg cmd_vel_mux)"/>
 
 
 

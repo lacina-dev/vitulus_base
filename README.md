@@ -4,6 +4,32 @@ Wheel ROS controller for VITULUS. It is a driver for moteus controllers.
 it is necessary to map the USB port where fdcanusb is connected to /dev/fdcanusb before you run this controller.
 
 
+## Node [/cmd_vel_mux] — a person beats the software
+
+The only publisher of the wheel command `/mobile_base_controller/cmd_vel`
+(started by `launch/base_control.launch`, `respawn`; `cmd_vel_mux:=false` = the
+old direct `/cmd_vel`). Inputs by priority:
+
+| input | topic | priority |
+|---|---|---|
+| DS4 gamepad | `/ds4/cmd_vel` | 100 (human) |
+| web joystick / keyboard | `/teleop/cmd_vel` | 90 (human) |
+| all software (MBF, docking, mower recovery, agent supervisor) | `/cmd_vel` | 10 |
+
+A human input counts only when deflected (dead zone `~deadzone_linear` 0.02 m/s,
+`~deadzone_angular` 0.05 rad/s) or, for the DS4, on PS / L1 / R1
+(`~takeover_buttons`, read from `/ds4/status`) — the zeros a switched-on DS4
+sends with centred sticks never block the software. The first deflection is a
+takeover: the software's goals are cancelled once (`/move_base_flex/{exe_path,
+move_base,recovery}/cancel`, `/smach_goal/cancel`, `/dock_smach/stop`,
+`/mower_smach/stop`) and `/cmd_vel_mux/takeover` names the source. The human
+keeps the wheels `~hold_s` (1.5 s) after the last deflection (released sticks =
+zeros = stop); the software is accepted again only after it has been quiet for
+`~rearm_quiet_s` (1 s), so nothing drives on by itself. Drive motors are never
+switched off. Status: `/cmd_vel_mux/active` (latched `ds4|teleop|nav|nav_blocked`),
+`/cmd_vel_mux/status` (JSON). Test: `test/test_cmd_vel_mux.py` (own roscore on
+:11977, never the robot master).
+
 ## Node [/vitulus_base_node]
 
 
@@ -29,7 +55,7 @@ Subscriptions:
  * /base/rear_left_wheel_real_vel [std_msgs/Float32]
  * /base/rear_right_wheel_angle [std_msgs/Float32]
  * /base/rear_right_wheel_real_vel [std_msgs/Float32]
- * /cmd_vel [geometry_msgs/Twist]
+ * /mobile_base_controller/cmd_vel [geometry_msgs/Twist] — only from cmd_vel_mux
 
 Services: 
  * /controller_manager/list_controller_types

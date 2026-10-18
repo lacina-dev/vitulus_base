@@ -81,6 +81,7 @@ install(DIRECTORY launch
 
 catkin_install_python(PROGRAMS
   nodes/base_controller
+  nodes/cmd_vel_mux
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
