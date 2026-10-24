@@ -23,7 +23,7 @@
     <node name="vitulus_base_node" pkg="vitulus_base" type="vitulus_base_node">
         <remap from="/mobile_base_controller/cmd_vel" to="/cmd_vel" unless="$(arg cmd_vel_mux)"/>
     </node>
-    <node name="cmd_vel_mux" pkg="vitulus_base" type="cmd_vel_mux" output="screen"
+    <node name="cmd_vel_mux" pkg="vitulus_base" type="cmd_vel_mux" output="log"
           respawn="true" respawn_delay="1" if="$(arg cmd_vel_mux)"/>
 
     <!-- drive_primitive (18. 10. 2026): closed-loop direct driving (straight /
@@ -35,7 +35,7 @@
          wheels anyway).  drive_primitive:=false = not started. -->
     <arg name="drive_primitive" default="true"/>
     <group if="$(arg cmd_vel_mux)">
-        <node name="drive_primitive" pkg="vitulus_base" type="drive_primitive" output="screen"
+        <node name="drive_primitive" pkg="vitulus_base" type="drive_primitive" output="log"
               respawn="true" respawn_delay="1" if="$(arg drive_primitive)"/>
     </group>
 
@@ -44,7 +44,7 @@
     <!-- Controller -->
     <rosparam command="load" file="$(find vitulus_base)/config/base_common.yaml"/>
 
-    <node name="controller_spawner" pkg="controller_manager" type="spawner" output="screen"
+    <node name="controller_spawner" pkg="controller_manager" type="spawner" output="log"
           args="joint_state_controller
           mobile_base_controller"/>
 
@@ -55,7 +55,7 @@
          (UI / display button, dock_smach undock, docking controller). true = legacy
          behaviour (power-cycle and enable the motors right after start). -->
     <arg name="motors_on_at_start" default="false"/>
-    <node pkg="vitulus_base" type="base_controller" name="base_controller" output="screen" respawn="true">
+    <node pkg="vitulus_base" type="base_controller" name="base_controller" output="log" respawn="true">
         <param name="motors_on_at_start" value="$(arg motors_on_at_start)"/>
     </node>
 
