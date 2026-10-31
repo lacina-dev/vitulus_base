@@ -45,13 +45,25 @@ Rules
     human inputs still beat everything, primitive included; a takeover also
     sends True on /drive_primitive/stop.  Without anything on
     /drive_primitive/cmd_vel the mux behaves exactly as before.
+  * HOLD (31. 10. 2026): any source may hold all software, the priority between
+    the software inputs and the people.  /cmd_vel_mux/hold (std_msgs/String,
+    JSON {"source": str, "hold": bool, "reason": str, "data": {...}}) engages a
+    hold that stays until the SAME source releases it with hold=false.  While
+    any hold stands every software input is dropped and zeros go to the base
+    at 10 Hz; the people still drive as always (their takeover works as above).
+    The hold never times out: a source that dies leaves the robot standing
+    (status shows `orphaned`), and it survives a mux restart (rosparam
+    `~holds`, read before the inputs are subscribed).  /cmd_vel_mux/held
+    (std_msgs/Bool, latched) tells the state machines to wait instead of
+    counting the stopped robot as a failure.
   * The node forwards each message as it arrives and never repeats one; when the
     chosen input stops, the controller's cmd_vel_timeout (0.25 s) stops the
     wheels.  When this node is down nothing reaches the base: the robot stands.
 
 Status: /cmd_vel_mux/active (std_msgs/String, latched: ds4 | teleop |
-primitive | nav | nav_blocked), /cmd_vel_mux/status (JSON, latched, on change + 1 Hz),
-/cmd_vel_mux/takeover (std_msgs/String, one message per takeover).
+primitive | nav | nav_blocked | hold), /cmd_vel_mux/status (JSON, latched, on
+change + 1 Hz), /cmd_vel_mux/takeover (std_msgs/String, one message per takeover),
+/cmd_vel_mux/held (std_msgs/Bool, latched, on change + 1 Hz).
 """
 import json
 import threading
@@ -120,6 +132,21 @@ class Mux(object):
                                          '/mower_smach/active_program'),
                          String, self._mower_program, queue_size=1)
 
+        # source -> {'reason', 'data', 'since', 'last'}; before the inputs subscribe
+        # so a mux restarted during a hold never lets a software command through.
+        self.hold_keepalive_s = float(rospy.get_param('~hold_keepalive_s', 3.0))
+        self.holds = {}
+        self.hold_blocked_last = None    # monotonic of the last software cmd dropped by a hold
+        now = self.clock()
+        saved = rospy.get_param('~holds', {}) or {}
+        for src, h in saved.items():
+            self.holds[src] = {'reason': (h or {}).get('reason', ''),
+                               'data': (h or {}).get('data', {}), 'since': now, 'last': None}
+        if self.holds:
+            rospy.logwarn('cmd_vel_mux: hold restored after restart: %s', sorted(self.holds))
+        self.pub_held = rospy.Publisher('~held', Bool, queue_size=1, latch=True)
+        rospy.Subscriber('~hold', String, self._hold, queue_size=20)
+
         self.human_last_deflect = {}     # name -> monotonic of the last deflected msg
         self.takeover_active = False
         self.takeover_count = 0
@@ -163,6 +190,58 @@ class Mux(object):
             if self.mower_busy is None:
                 return True
             return bool(self.mower_busy) or bool(self.mower_program)
+
+    # -- hold ---------------------------------------------------------------
+    def _hold(self, msg):
+        try:
+            req = json.loads(msg.data)
+            src = str(req['source'])
+            want = bool(req['hold'])
+        except (ValueError, KeyError, TypeError) as exc:
+            rospy.logerr('cmd_vel_mux: bad hold request %r: %s', msg.data, exc)
+            return
+        now = self.clock()
+        save = False
+        with self.lock:
+            h = self.holds.get(src)
+            if want:
+                self.holds[src] = {'reason': str(req.get('reason', '')),
+                                   'data': req.get('data', {}),
+                                   'since': h['since'] if h else now, 'last': now}
+                save = h is None or h['data'] != self.holds[src]['data']
+                if h is None:
+                    rospy.logwarn('cmd_vel_mux: HOLD by %s (%s): software stopped',
+                                  src, req.get('reason', ''))
+                    if self._human_owner(now) is None:
+                        self.out.publish(Twist())   # stop at once, not on the next tick
+            elif h is not None:
+                del self.holds[src]
+                save = True
+                rospy.logwarn('cmd_vel_mux: hold by %s released', src)
+        if save:
+            self._save_holds()
+            self._publish_status(force=True)
+
+    def _save_holds(self):
+        with self.lock:
+            snapshot = {s: {'reason': h['reason'], 'data': h['data']}
+                        for s, h in self.holds.items()}
+        try:
+            if snapshot:
+                rospy.set_param('~holds', snapshot)
+            elif rospy.has_param('~holds'):
+                rospy.delete_param('~holds')
+        except Exception as exc:  # noqa: BLE001 - the in-memory hold still stands
+            rospy.logerr('cmd_vel_mux: could not save holds: %s', exc)
+
+    def _hold_status(self, now):
+        out = {}
+        for src, h in self.holds.items():
+            age = None if h['last'] is None else now - h['last']
+            out[src] = {'reason': h['reason'], 'data': h['data'],
+                        'held_s': round(now - h['since'], 1),
+                        'orphaned': age is None or age > self.hold_keepalive_s}
+        return out
 
     # -- decisions ----------------------------------------------------------
     def _human_owner(self, now):
@@ -229,6 +308,10 @@ class Mux(object):
                 moving = deflected(msg, self.dz_lin, self.dz_ang)
                 self._update_rearm(now)
                 forward = self._human_owner(now) is None and self._nav_admit(caller, now)
+                if self.holds:
+                    forward = False
+                    if moving:
+                        self.hold_blocked_last = now
                 if forward:
                     owner = self._software_owner(now)
                     if owner is not None and int(owner['priority']) > int(inp['priority']):
@@ -243,8 +326,7 @@ class Mux(object):
                         self.nav_blocked_now[caller] = now
             if forward:
                 self.last_forwarded = inp['name']
-        if forward:
-            self.out.publish(msg)
+                self.out.publish(msg)       # under the lock: a hold cannot slip in between
 
     def _ds4_status(self, msg):
         now = self.clock()
@@ -299,6 +381,8 @@ class Mux(object):
         owner = self._human_owner(now)
         if owner is not None:
             return owner['name']
+        if self.holds:
+            return 'hold'
         sw = self._software_owner(now)
         if sw is not None and sw['name'] != 'nav' and int(sw['priority']) > min(
                 int(i['priority']) for i in self.inputs if not i.get('human')):
@@ -309,7 +393,10 @@ class Mux(object):
 
     def _tick(self, _evt):
         with self.lock:
-            self._update_rearm(self.clock())
+            now = self.clock()
+            self._update_rearm(now)
+            if self.holds and self._human_owner(now) is None:
+                self.out.publish(Twist())
         self._publish_status()
 
     def _publish_status(self, force=False):
@@ -322,12 +409,17 @@ class Mux(object):
                   'nav_blocked': self._blocked_callers(now),
                   'takeovers': self.takeover_count,
                   'last_takeover': self.last_takeover, 'hold_s': self.hold_s,
-                  'rearm_quiet_s': self.rearm_quiet_s}
+                  'rearm_quiet_s': self.rearm_quiet_s,
+                  'held': bool(self.holds), 'holds': self._hold_status(now),
+                  'hold_blocked_age': (None if self.hold_blocked_last is None
+                                       else round(now - self.hold_blocked_last, 1))}
+            held = bool(self.holds)
         if changed or force:
             self.pub_active.publish(String(state))
         self._status_n = getattr(self, '_status_n', 0) + 1
         if changed or force or self._status_n % 10 == 0:
             self.pub_status.publish(String(json.dumps(st, sort_keys=True)))
+            self.pub_held.publish(Bool(held))
 
 
 def main():

@@ -37,6 +37,13 @@ owns the wheels, lower ones are dropped (non-zero drops listed in
 `/cmd_vel_mux/status` (JSON). Test: `test/test_cmd_vel_mux.py` (own roscore on
 :11977, never the robot master).
 
+Hold (31. 10. 2026): `/cmd_vel_mux/hold` (`std_msgs/String`, JSON `{"source", "hold",
+"reason", "data"}`) stops all software, below the people; zeros go to the base at 10 Hz.
+Only the same source releases it. It has no timeout and survives a mux restart (param
+`~holds`); a silent source shows as `orphaned` in the status and the robot stays stopped.
+`/cmd_vel_mux/held` (`Bool`, latched) tells mower_smach and dock_smach to wait.
+First user: `vitulus_gnss/nodes/gnss_watchdog`. Test: `vitulus_gnss/test/test_gnss_watchdog.py`.
+
 ## Node [/drive_primitive] — closed-loop direct driving
 
 One small motion at a time, closed on odometry (`~odom_topic` /odometry/odom,

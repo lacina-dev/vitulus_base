@@ -33,6 +33,7 @@ Interface
 
 Guards (any one -> ABORTED with the reason; at the start -> REJECTED, nothing
 moves): human takeover (/cmd_vel_mux/active ds4|teleop, /cmd_vel_mux/takeover),
+a mux hold (/cmd_vel_mux/active hold: the motion is over, nobody resumes it),
 stop, keepalive lost, supervisor not RUNNING/stale (when required), drive
 motors off (/base/motor_power_state False), stale odometry (> ~odom_timeout),
 stale or missing lidar (> ~scan_timeout), obstacle in the direction of travel
@@ -51,6 +52,7 @@ import time
 
 STATES = ('IDLE', 'RUNNING', 'SUCCEEDED', 'ABORTED', 'REJECTED')
 HUMAN_INPUTS = ('ds4', 'teleop')
+MUX_HOLD = 'hold'      # cmd_vel_mux dropped all software (31. 10. 2026)
 
 DEFAULTS = {
     'max_linear': 0.3, 'max_angular': 0.8,
@@ -115,6 +117,8 @@ class Driver(object):
             self.mux_active = (name or '').strip()
             if self.cmd and self.mux_active in HUMAN_INPUTS:
                 self._end('ABORTED', 'human takeover (%s)' % self.mux_active)
+            elif self.cmd and self.mux_active == MUX_HOLD:
+                self._end('ABORTED', 'hold')
 
     def on_takeover(self, source):
         with self.lock:
@@ -342,6 +346,8 @@ class Driver(object):
         p = self.p
         if self.mux_active in HUMAN_INPUTS:
             return 'human takeover (%s)' % self.mux_active
+        if self.mux_active == MUX_HOLD:
+            return 'hold'
         if not start and cmd['keepalive_s'] > 0 and now - cmd['keepalive_t'] > cmd['keepalive_s']:
             return 'keepalive lost (%.1f s)' % (now - cmd['keepalive_t'])
         if cmd['require_supervisor']:

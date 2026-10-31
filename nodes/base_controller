@@ -184,7 +184,7 @@ class ControllerState:
 class MotorController:
     def __init__(self, id_nr):
         self.id = id_nr
-        self.c = moteus.Controller(self.id)
+        self.c = None   # exists only while powered, see _open_transport
         self.state = ControllerState(self.id)
         self.velocity = 0
 
@@ -217,21 +217,48 @@ class BaseController:
         self.motors_switch = False
         self.motors_power_switch = None
         self.motors_switch_pub = None
-        self.stop_controller = False
-        self.stop_power = False
-        self.start_controller = False
-        self.start_power = False
         self.ros_ready = False
         self.controller_status = False
         # Boot policy: drive motor power stays OFF after node start until something
         # deliberately publishes True on /base/motor_power (~motors_on_at_start).
         self.motors_on_at_start = False
-        self.power_on_pending = False     # True while an explicit power-on is in progress
         self.pm_status_received = False   # first /pm/power_status seen
         self.start_stamp = time.time()
         # A latched True replayed by a publisher that outlived this node (respawn) is
         # a stale command, not a deliberate enable - ignored for this long after start.
         self.STALE_LATCH_IGNORE_S = 5.0
+        # Motor power is one state machine (power_step): the last request wins, an
+        # OFF always goes first, and an ON only runs through off -> on -> drives
+        # answered. Drives and the CAN adapter are only touched while powered.
+        #
+        # Measured 31. 10. 2026, dock: drives answer 0.1-0.18 s after ON; after OFF the
+        # rail falls 23.5 -> 7 V in 0.16 s. An ON into that fall, from position mode:
+        # gap up to 0.08 s = fault 33 or TIMEOUT, cleared by a stop; gap up to 0.25 s =
+        # about 3 in 90 all four drives silent, no stop or new port helps, one more
+        # power cycle does. So OFF lasts at least min_off_s and a silent start gets
+        # a full power cycle.
+        self.POWER_ON_RETRY_S = 1.0
+        self.POWER_ON_GIVE_UP_S = 10.0
+        self.POWER_OFF_RETRY_S = 0.3
+        self.MOTOR_REPLY_TIMEOUT_S = 0.3
+        self.MIN_OFF_S = 2.0           # ~min_off_s
+        self.BOOT_SETTLE_S = 0.5       # ~boot_settle_s, first CAN frame after power-on
+        self.BOOT_TIMEOUT_S = 2.0      # ~boot_timeout_s, all four drives must answer
+        self.BOOT_ATTEMPTS = 3         # ~boot_attempts, full off/on cycles
+        self.MIN_RAIL_V = 16.0         # below it a drive is on a dying rail
+        self.RUN_FAILS_REOPEN = 5      # bad cycles in a row before the port is reopened
+        self.power_state = 'OFF'       # OFF, WAIT_OFF, PM_ON, BOOT, RUN, PM_OFF
+        self.want_on = False
+        self.force_off = True          # force the output OFF once at node start
+        self.power_failed = None       # text of the failure to report
+        self.boot_attempt = 0
+        self.off_since = None          # wall clock of the confirmed OFF
+        self.pm_on_since = None
+        self.pm_sent = 0.0
+        self.pm_off_since = None
+        self.run_fails = 0
+        self.transport = None
+        self.pub_log_info = None
         self.pub_front_left_velocity = rospy.Publisher("/base/front_left_wheel_real_vel", Float32, queue_size=10)
         self.pub_front_right_velocity = rospy.Publisher("/base/front_right_wheel_real_vel", Float32, queue_size=10)
         self.pub_rear_left_velocity = rospy.Publisher("/base/rear_left_wheel_real_vel", Float32, queue_size=10)
@@ -283,6 +310,10 @@ class BaseController:
         except Exception as e:
             sys.stderr.write("base_controller: motor power OFF publish failed: %s\n" % e)
 
+    async def _reply(self, call):
+        """A moteus call that cannot block the controller loop."""
+        return await asyncio.wait_for(call, self.MOTOR_REPLY_TIMEOUT_S)
+
     async def stop_motors(self, timeout=0.3):
         """Best effort set_stop on every drive, bounded so it cannot block exit."""
         for config in self.motor_configs:
@@ -294,125 +325,258 @@ class BaseController:
             except Exception as e:
                 sys.stderr.write("base_controller: stop motor %s failed: %r\n" % (config['name'], e))
 
-    async def run(self):
-        ## Run Moteus controller
+    # ---- CAN adapter --------------------------------------------------------
+    def _close_transport(self):
+        """Drop the port: nothing queues for an unpowered bus and a stream that
+        lost sync (a late reply after a timeout) cannot carry over."""
+        t, self.transport = self.transport, None
+        for config in self.motor_configs:
+            config['obj'].c = None
+        if t is None:
+            return
+        try:
+            serial_port = t._serial
+            asyncio.get_event_loop().remove_reader(serial_port.fd)
+            serial_port.serial.close()
+        except Exception as e:
+            rospy.logwarn("base_controller: closing CAN adapter failed: %r" % (e,))
 
-        # Wait for the power module open the motor switch
-        wait_int_counter = 0
-        wait_int_nr = 10
-        while not self.ros_ready:
+    def _open_transport(self):
+        self._close_transport()
+        self.transport = moteus.Fdcanusb()
+        for config in self.motor_configs:
+            config['obj'].c = moteus.Controller(config['obj'].id, transport=self.transport)
+
+    # ---- power state machine -------------------------------------------------
+    def _set_power_state(self, state):
+        if state != self.power_state:
+            rospy.loginfo("Motor power: %s -> %s" % (self.power_state, state))
+        self.power_state = state
+
+    def _fail(self, text):
+        rospy.logerr(text)
+        if self.pub_log_info is not None:
+            self.pub_log_info.publish(String(text))
+
+    def _zero_commands(self):
+        with self.lock:
+            for config in self.motor_configs:
+                config['obj'].velocity = 0.0
+
+    async def _begin_off(self):
+        """Into PM_OFF from any state: drives stopped, port closed, ON no more."""
+        with self.lock:
+            self.controller_status = False
+        self._zero_commands()
+        if self.transport is not None:
+            await self.stop_motors()
+        self._close_transport()
+        self.pm_off_since = time.time()
+        self.pm_sent = 0.0
+        self._set_power_state('PM_OFF')
+
+    def _pm_off_step(self, now):
+        """OFF is repeated until the power module reports it, however long."""
+        # Always sent at least once: a just-failed ON may still reach the module.
+        if self.pm_sent > 0.0 and not self.motors_switch and self.pm_status_received:
+            rospy.loginfo("Motor power output disabled.")
+            self.off_since = now
+            self.force_off = False
+            self._set_power_state('OFF')
+            return
+        if now - self.pm_sent >= self.POWER_OFF_RETRY_S:
+            self.motors_switch_pub.publish(Bool(data=False))
+            self.pm_sent = now
+            if now - self.pm_off_since >= 5.0:
+                rospy.logerr_throttle(10.0, "Power module does not confirm motor power OFF.")
+
+    def _pm_on_step(self, now):
+        if self.motors_switch:
+            rospy.loginfo("Motor power output enabled (%.2f s)." % (now - self.pm_on_since))
+            self.pm_on_since = now
+            self._zero_commands()
+            self._set_power_state('BOOT')
+            return False
+        if now - self.pm_on_since >= self.POWER_ON_GIVE_UP_S:
+            self.boot_attempt = self.BOOT_ATTEMPTS
+            self.power_failed = ("Motors did not power on - no answer from power module")
+            return True
+        if now - self.pm_sent >= self.POWER_ON_RETRY_S:
+            rospy.logwarn("Still waiting for Power module enable motor power output...")
+            self.motors_switch_pub.publish(Bool(data=True))
+            self.pm_sent = now
+        return False
+
+    async def _boot(self):
+        """Powered: every drive must answer on a live rail, faults cleared.
+        Returns True when all four are ready; a False means a new full cycle."""
+        started = self.pm_on_since
+        while time.time() - started < self.BOOT_SETTLE_S:
+            if not self.want_on or self.should_exit():
+                return False
+            await asyncio.sleep(0.02)
+        pending = list(self.motor_configs)
+        detail = {}
+        while pending:
+            if not self.want_on or self.should_exit():
+                return False
+            if time.time() - started >= self.BOOT_TIMEOUT_S:
+                self.power_failed = "Motors not answering after power-on: %s" % ", ".join(
+                    "%s (%s)" % (c['name'], detail.get(c['name'], 'no reply')) for c in pending)
+                return False
+            try:
+                if self.transport is None:
+                    self._open_transport()
+            except Exception as e:
+                detail = {c['name']: 'CAN adapter: %r' % (e,) for c in pending}
+                await asyncio.sleep(0.2)
+                continue
+            for config in list(pending):
+                try:
+                    c = config['obj'].c
+                    await self._reply(c.set_stop())   # also clears a latched fault
+                    state = await self._reply(c.query())
+                except Exception as e:
+                    # A late reply would be read as the answer to the next command.
+                    detail[config['name']] = 'no reply' if isinstance(
+                        e, asyncio.TimeoutError) else repr(e)
+                    self._close_transport()
+                    break
+                if not state:
+                    detail[config['name']] = 'empty reply'
+                    continue
+                voltage = state.values[moteus.Register.VOLTAGE]
+                fault = state.values[moteus.Register.FAULT]
+                mode = state.values[moteus.Register.MODE]
+                if fault != ControllerState.FAULT_OK or voltage < self.MIN_RAIL_V:
+                    detail[config['name']] = 'mode %s fault %s %.1f V' % (mode, fault, voltage)
+                    continue
+                rospy.loginfo("Motor %s ready %.2f s after power-on (%.1f V, mode %s)."
+                              % (config['name'], time.time() - started, voltage, mode))
+                with self.lock:
+                    config['obj'].state.set_values(state)
+                pending.remove(config)
+            await asyncio.sleep(0.05)
+        return True
+
+    async def _run_cycle(self):
+        """One velocity command + state read per drive. Failures are reported and
+        left to safety_node (no data -> OFF): power is never cycled under a moving
+        robot, and motors never come back on by themselves."""
+        with self.lock:
+            current_max_torque = RobotSpec.torque_recent if RobotSpec.torque_recent > 0 else self.DEFAULT_MAX_TORQUE
+        all_ok = True
+        for config in self.motor_configs:
+            motor_obj = config['obj']
+            if not motor_obj.c:
+                all_ok = False
+                continue
+            with self.lock:  # velocity is set by ROS callbacks
+                # Target wheel velocity (rad/s) to motor velocity (RPS)
+                motor_target_rps = motor_obj.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS * config['vel_cmd_multiplier']
+            try:
+                await self._reply(motor_obj.c.set_position(
+                    position=math.nan,  # Position control mode, but target is velocity
+                    velocity=motor_target_rps,
+                    feedforward_torque=self.MOTOR_FF_TORQUE,
+                    kp_scale=self.MOTOR_KP_SCALE,
+                    kd_scale=self.MOTOR_KD_SCALE,
+                    maximum_torque=current_max_torque,
+                    stop_position=None,  # No specific stop position for pure velocity control
+                    watchdog_timeout=self.MOTOR_WATCHDOG_TIMEOUT,
+                    query=False))
+                state_data = await self._reply(motor_obj.c.query())
+                if state_data:
+                    with self.lock:
+                        motor_obj.state.set_values(state_data)
+                    # Our own loop paused past the drive watchdog (23. 8. 2026: two
+                    # wheels sat in TIMEOUT on a live rail). The drive leaves that
+                    # mode only through a stop, the next command then resumes.
+                    if state_data.values[moteus.Register.MODE] == ControllerState.MODE_TIMEOUT:
+                        rospy.logwarn_throttle(2.0, "Motor %s watchdog timeout - stop to resume." % config['name'])
+                        await self._reply(motor_obj.c.set_stop())
+                else:
+                    all_ok = False
+            except Exception as e:
+                all_ok = False
+                rospy.logerr_throttle(2.0, f"Error commanding/querying motor {motor_obj.id} ({config['name']}): {e!r}")
+                break
+        self.run_fails = 0 if all_ok else self.run_fails + 1
+        if self.run_fails >= self.RUN_FAILS_REOPEN:
+            self.run_fails = 0
+            rospy.logwarn("Motor bus not answering - reopening the CAN adapter.")
+            try:
+                self._open_transport()
+            except Exception as e:
+                rospy.logerr_throttle(2.0, "Reopening the CAN adapter failed: %r" % (e,))
+
+    async def power_step(self, now):
+        state = self.power_state
+        if state == 'PM_OFF':
+            self._pm_off_step(now)
+            return
+        if self.force_off or not self.want_on:
+            if state != 'OFF' or self.force_off or (self.motors_switch and self.pm_status_received):
+                await self._begin_off()    # also catches an ON from elsewhere
+            return
+        if state == 'OFF':
+            self.boot_attempt = max(self.boot_attempt, 1)
+            self._set_power_state('WAIT_OFF')
+            return
+        if state == 'WAIT_OFF':
+            if self.off_since is None or now - self.off_since >= self.MIN_OFF_S:
+                self.motors_switch_pub.publish(Bool(data=True))
+                self.pm_on_since = self.pm_sent = now
+                rospy.loginfo("Wait for Power module enable motor power output... (attempt %d)"
+                              % self.boot_attempt)
+                self._set_power_state('PM_ON')
+            return
+        give_up = False
+        if state == 'PM_ON':
+            give_up = self._pm_on_step(now)
+        elif state == 'BOOT':
+            if await self._boot():
+                with self.lock:
+                    self.controller_status = True
+                self.boot_attempt = 0
+                self.run_fails = 0
+                rospy.loginfo("Controller started.")
+                self._set_power_state('RUN')
+                return
+            if not self.want_on or self.should_exit():
+                return
+            give_up = True
+        elif state == 'RUN':
+            await self._run_cycle()
+            return
+        if not give_up:
+            return
+        # A failed try: the full cycle (real OFF, min_off_s, ON). A second cause of
+        # a dead start is what only a full power-off cures.
+        if self.boot_attempt < self.BOOT_ATTEMPTS:
+            rospy.logwarn("%s - power cycle, attempt %d of %d." % (
+                self.power_failed, self.boot_attempt + 1, self.BOOT_ATTEMPTS))
+            self.boot_attempt += 1
+        else:
+            self._fail(self.power_failed)
+            self.boot_attempt = 0
+            with self.lock:
+                self.want_on = False
+        self.power_failed = None
+        await self._begin_off()
+
+    async def run(self):
+        while not self.motors_switch_pub or not self.ros_ready:
             if self.should_exit():
                 return
-            await asyncio.sleep(0.3)
-            # Motors may legitimately stay OFF here for a long time (boot default).
-            # Only nag the power module while a power-on was really requested.
-            if not self.power_on_pending:
-                wait_int_counter = 0
-                continue
-            if (wait_int_nr == wait_int_counter):
-                rospy.logwarn("Still waiting for Power module enable motor power output...")
-                # send turn on message to power module again
-                new_msg = Bool()
-                new_msg.data = True
-                self.motors_switch_pub.publish(new_msg)
-                wait_int_counter = 0
-            wait_int_counter +=1
-
-        for config in self.motor_configs:
-            if config['obj'].c:
-                await config['obj'].c.set_stop()
-
-        start_time = time.time()
+            await asyncio.sleep(0.05)
         while not self.should_exit():
-
-            if self.stop_controller:
-                if self.controller_status:
-                    rospy.loginfo("Controller shutting down...")
-                    for config in self.motor_configs:
-                        motor_obj = config['obj']
-                        if motor_obj.c:
-                            try:
-                                await motor_obj.c.set_stop()
-                            except Exception as e:
-                                rospy.logerr(f"Error stopping motor {motor_obj.id} ({config['name']}): {e}")
-                            motor_obj.c = None
-                        # Reset state more consistently
-                        with self.lock:
-                            motor_obj.state.mode = ControllerState.MODE_STOPPED
-                            motor_obj.state.position = 0.0
-                            motor_obj.state.velocity = 0.0
-                            motor_obj.state.torque = 0.0
-                            motor_obj.state.voltage = 0.0
-                            motor_obj.state.temperature = 0.0
-                            motor_obj.state.fault = ControllerState.FAULT_OK
-                    
-                    with self.lock:
-                        self.stop_controller = False
-                    with self.lock:
-                        self.stop_power = True
-                    with self.lock:
-                        self.controller_status = False
-                    rospy.loginfo("Controller is shut down.")
-
-            if self.start_controller:
-                rospy.loginfo("Controller starting...")
-                for config in self.motor_configs:
-                    motor_obj = config['obj']
-                    # Re-initialize controller object if it's None or not the right type
-                    if not isinstance(motor_obj.c, moteus.Controller):
-                         motor_obj.c = moteus.Controller(motor_obj.id)
-                    
-                    if motor_obj.c: # Ensure it was created
-                        await motor_obj.c.set_stop()
-                        # Set initial position to current encoder reading, or zero.
-                        # Using make_set_output_nearest ensures it starts from current position.
-                        motor_obj.c.make_set_output_nearest(position=0.0) # Or math.nan if you want it to hold current
-
-                with self.lock:
-                    self.start_controller = False
-                    self.controller_status = True
-                rospy.loginfo("Controller started.")
-
-            ### Set controllers velocities and read states #######
-            with self.lock: # Lock for accessing shared RobotSpec.torque_recent
-                current_max_torque = RobotSpec.torque_recent if RobotSpec.torque_recent > 0 else self.DEFAULT_MAX_TORQUE
-            
-            for config in self.motor_configs:
-                motor_obj = config['obj']
-                vel_cmd_multiplier = config['vel_cmd_multiplier']
-
-                with self.lock: # Lock for accessing motor_obj.velocity set by ROS callbacks
-                    # Convert target wheel velocity (rad/s) to motor velocity (RPS)
-                    motor_target_rps = motor_obj.velocity * RobotSpec.WHEEL_RAD_TO_MOT_RPS * vel_cmd_multiplier
-                
-                if motor_obj.c: # If controller is active
-                    try:
-                        await motor_obj.c.set_position(
-                            position=math.nan, # Position control mode, but target is velocity
-                            velocity=motor_target_rps,
-                            feedforward_torque=self.MOTOR_FF_TORQUE, # Applied as is, sign might need to depend on velocity
-                            kp_scale=self.MOTOR_KP_SCALE,
-                            kd_scale=self.MOTOR_KD_SCALE,
-                            maximum_torque=current_max_torque,
-                            stop_position=None, # No specific stop position for pure velocity control
-                            watchdog_timeout=self.MOTOR_WATCHDOG_TIMEOUT,
-                            query=False) # Query separately for all motors after sending all commands potentially
-                        
-                        state_data = await motor_obj.c.query()
-                        if state_data:
-                            with self.lock: # Lock for updating shared motor_obj.state
-                                motor_obj.state.set_values(state_data)
-                        else:
-                            rospy.logwarn(f"No state data received for motor {motor_obj.id} ({config['name']})")
-
-                    except Exception as e:
-                        rospy.logerr(f"Error commanding/querying motor {motor_obj.id} ({config['name']}): {e}")
-            
+            await self.power_step(time.time())
             await asyncio.sleep(0.01)
-
         # Leaving on shutdown: drives to stop (power output is commanded OFF by the
         # pre-shutdown hook). Nothing is enabled here.
-        await self.stop_motors()
+        if self.transport is not None:
+            await self.stop_motors()
 
     def publish_velocity(self):
         ## Publish controllers velocities
@@ -467,6 +631,14 @@ class BaseController:
 
 
 
+    def _request(self, on, msg):
+        with self.lock:
+            changed = on != self.want_on
+            self.want_on = on
+        if changed:
+            header = getattr(msg, '_connection_header', None) or {}
+            rospy.loginfo("Motor power request %s from %s" % ('ON' if on else 'OFF', header.get('callerid', '?')))
+
     def callback_motor_power(self, msg):
         if msg.data:
             # Right after (re)start a latched publisher replays its LAST command.
@@ -478,11 +650,9 @@ class BaseController:
                 rospy.logwarn("Ignoring latched motor power ON replayed at node start "
                               "(from %s). Motors stay OFF." % header.get('callerid', '?'))
                 return
-            with self.lock:
-                self.start_power = True
+            self._request(True, msg)
         else:
-            with self.lock:
-                self.stop_controller = True
+            self._request(False, msg)
 
     def callback_set_torque(self, msg):
         with self.lock:
@@ -513,9 +683,12 @@ class BaseController:
 
     # Stop controller if motor output switch off message for power module is received.
     def callback_pm_set_motor_switch(self, msg):
-        if not msg.data:
-            with self.lock:
-                self.stop_controller = True
+        # Our own commands come back here; a command from elsewhere (power panel,
+        # e-stop) is a request like /base/motor_power, so the drives follow it.
+        header = getattr(msg, '_connection_header', None) or {}
+        if header.get('callerid') == rospy.get_name():
+            return
+        self._request(bool(msg.data), msg)
 
 async def main():
     controller = BaseController()
@@ -569,68 +742,30 @@ async def main():
         controller.motors_on_at_start = bool(rospy.get_param('~motors_on_at_start', False))
         # Cmd while motors are off -> tell the user instead of silently not moving.
         pub_log_info = rospy.Publisher('/nextion/log_info', String, queue_size=10)
+        controller.pub_log_info = pub_log_info
         cmd_while_off_since = None
         cmd_while_off_warned = 0.0
 
-        first_run = True
-        controller.stop_power = True
+        controller.MIN_OFF_S = float(rospy.get_param('~min_off_s', controller.MIN_OFF_S))
+        controller.BOOT_SETTLE_S = float(rospy.get_param('~boot_settle_s', controller.BOOT_SETTLE_S))
+        controller.BOOT_TIMEOUT_S = float(rospy.get_param('~boot_timeout_s', controller.BOOT_TIMEOUT_S))
+        controller.BOOT_ATTEMPTS = int(rospy.get_param('~boot_attempts', controller.BOOT_ATTEMPTS))
         slow_counter = 0
         slow_limit = rate/2 ## 2x per second ToDo: refactor to timer
+        # The first OFF must really reach the power module: wait (bounded) until it
+        # reports, or a switch left ON by a killed predecessor would go unnoticed.
+        wait_start = time.time()
+        while (not controller.pm_status_received and not rospy.is_shutdown()
+               and (time.time() - wait_start) < 10.0):
+            time.sleep(0.1)
+        if not controller.pm_status_received:
+            rospy.logwarn("No /pm/power_status yet - motor power OFF not verified.")
+        if controller.motors_on_at_start:
+            with controller.lock:
+                controller.want_on = True
+        controller.ros_ready = True
         rospy.loginfo("Moteus controller initialized.")
         while not controller.should_exit():
-
-            ## Turn off the motor switch in power module
-            if controller.stop_power:
-                if first_run:
-                    # The very first OFF must really reach the power module: wait
-                    # (bounded) until it reports, otherwise the message is published
-                    # before the connection exists and a switch left ON by a killed
-                    # predecessor would go unnoticed.
-                    wait_start = time.time()
-                    while (not controller.pm_status_received and not rospy.is_shutdown()
-                           and (time.time() - wait_start) < 10.0):
-                        time.sleep(0.1)
-                    if not controller.pm_status_received:
-                        rospy.logwarn("No /pm/power_status yet - motor power OFF not verified.")
-                new_msg = Bool()
-                new_msg.data = False
-                controller.motors_switch_pub.publish(new_msg)
-                rospy.loginfo("Wait for Power module disable motor power output...")
-                while controller.motors_switch and not rospy.is_shutdown():
-                    time.sleep(0.3)
-                    if controller.motors_switch:
-                        controller.motors_switch_pub.publish(new_msg)  # repeat until confirmed
-                rospy.loginfo("Motor power output disabled.")
-
-                controller.stop_power = False
-                if first_run:
-                    first_run = False
-                    if controller.motors_on_at_start:
-                        rospy.sleep(1)
-                        controller.start_power = True
-                    else:
-                        rospy.loginfo("Motor power stays OFF after start "
-                                      "(~motors_on_at_start=false). Waiting for /base/motor_power.")
-
-            ## Turn on the motor switch in power module
-            if controller.start_power:
-                controller.power_on_pending = True
-                new_msg = Bool()
-                new_msg.data = True
-                controller.motors_switch_pub.publish(new_msg)
-                rospy.loginfo("Wait for Power module enable motor power output...")
-                while not controller.motors_switch and not controller.should_exit():
-                    time.sleep(0.3)
-                if controller.should_exit():
-                    break
-                rospy.loginfo("Motor power output enabled.")
-
-                controller.power_on_pending = False
-                controller.start_power = False
-                # let the conrollers in asyncio start too
-                controller.start_controller = True
-                controller.ros_ready = True
-                controller.stop_controller = False
 
             ## Publish controllers positions
             controller.publish_position()
@@ -669,7 +804,7 @@ async def main():
             with controller.lock:
                 cmd_active = any(abs(config['obj'].velocity) > 0.05
                                  for config in controller.motor_configs)
-            if cmd_active and not controller.controller_status and not controller.start_power:
+            if cmd_active and not controller.controller_status and not controller.want_on:
                 now = time.time()
                 if cmd_while_off_since is None:
                     cmd_while_off_since = now

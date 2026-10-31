@@ -164,6 +164,17 @@ class TestDrive(unittest.TestCase):
         s = Sim(mux='ds4')
         self.assertEqual(s.cmd(kind='straight', distance_m=1.0)['state'], 'REJECTED')
 
+    def test_mux_hold(self):
+        s = Sim()
+        s.cmd(kind='straight', distance_m=1.0)
+        s.run(0.5)
+        s.drv.on_mux_active('hold')
+        st = s.run(1)
+        self.assertEqual((st['state'], st['reason']), ('ABORTED', 'hold'))
+        s = Sim(mux='hold')
+        st = s.cmd(kind='straight', distance_m=1.0)
+        self.assertEqual((st['state'], st['reason']), ('REJECTED', 'hold'))
+
     def test_stop(self):
         s = Sim()
         s.cmd(kind='straight', distance_m=1.0)
