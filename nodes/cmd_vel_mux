@@ -56,6 +56,24 @@ Rules
     `~holds`, read before the inputs are subscribed).  /cmd_vel_mux/held
     (std_msgs/Bool, latched) tells the state machines to wait instead of
     counting the stopped robot as a failure.
+  * LIMIT (1. 11. 2026, map rules): /cmd_vel_mux/limit (std_msgs/String, JSON
+    {"source": "map_rules", "stamp": t, "v_fwd": f, "v_back": f, "w": f,
+    "w_left": f, "w_right": f, "rules": n, "reason": str}, 5 Hz from vitulus_safety
+    map_rules_guard) clamps every software input at the one forward point; the
+    people are never clamped.  linear.x goes to [-v_back, v_fwd]; when that caps
+    it, angular.z is scaled by the same factor so the arc is kept, except under
+    a cap of LIMIT_KEEP_TURN_V, where the turn is kept: a robot stopped by a rule
+    must still be able to turn away.  angular.z is then clamped to w_left (+) /
+    w_right (-), both optional, `w` when missing.  The clamp has a direction on
+    purpose, a robot in or next to a nogo can leave, so rules do not use the hold.
+    No message ever, or rules == 0: nothing changes, the very message goes out.
+    Older than LIMIT_STALE_S with rules > 0: software output is zero, said once
+    on /map_rules/warning and /nextion/log_info, repeated every LIMIT_REPEAT_S, and
+    in status (limit.stale, the
+    state machines wait on that like on a hold).  A fresh limit that stops
+    everything for a reason nothing can drive around (LIMIT_FROZEN) is reported
+    the same way.  This survives a mux restart (rosparam ~limit_engaged) as stale
+    until the guard speaks again.
   * The node forwards each message as it arrives and never repeats one; when the
     chosen input stops, the controller's cmd_vel_timeout (0.25 s) stops the
     wheels.  When this node is down nothing reaches the base: the robot stands.
@@ -66,6 +84,7 @@ change + 1 Hz), /cmd_vel_mux/takeover (std_msgs/String, one message per takeover
 /cmd_vel_mux/held (std_msgs/Bool, latched, on change + 1 Hz).
 """
 import json
+import math
 import threading
 import time
 
@@ -89,6 +108,54 @@ DEFAULT_STOPS = ['/smach_goal/cancel', '/dock_smach/stop', '/mower_smach/stop',
 # Stops that make sense only while a mowing program runs (see the docstring).
 DEFAULT_PROGRAM_STOPS = ['/mower_smach/stop']
 DEFAULT_TAKEOVER_BUTTONS = ['button_ps', 'button_l1', 'button_r1']
+
+
+LIMIT_STALE_S = 1.0        # contract, MAP_OBJECTS.md section 5
+LIMIT_SOURCE = 'map_rules'
+LIMIT_KEEP_TURN_V = 0.05   # m/s; the lowest slow rule, below it only stopping is left
+LIMIT_WARN_S = 5.0
+LIMIT_REPEAT_S = 60.0
+LIMIT_FROZEN = ('tf_stale', 'nogo_unparsable')  # guard's reasons: no state may act on it
+
+
+def parse_limit(raw):
+    """/cmd_vel_mux/limit JSON -> dict, None for `no rules`.  ValueError when it
+    cannot be trusted: the caller keeps the old limit, which then goes stale."""
+    try:
+        d = json.loads(raw)
+    except (TypeError, ValueError):
+        raise ValueError('not JSON')
+    if not isinstance(d, dict) or d.get('source') != LIMIT_SOURCE:
+        raise ValueError('wrong source')
+
+    def num(key, default=None):
+        val = d.get(key, default)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError('%s is not a number' % key)
+        if not math.isfinite(val) or val < 0:
+            raise ValueError('%s out of range' % key)
+        return float(val)
+
+    if num('rules') == 0:
+        return None
+    w = num('w')
+    return {'v_fwd': num('v_fwd'), 'v_back': num('v_back'), 'w': w,
+            'w_left': num('w_left', w), 'w_right': num('w_right', w),
+            'rules': int(d['rules']), 'reason': str(d.get('reason', ''))}
+
+
+def clamp_cmd(v, w, lim):
+    """(v, w) under the limit `lim`, see LIMIT in the module docstring."""
+    cap = lim['v_fwd'] if v >= 0 else lim['v_back']
+    if abs(v) > cap:
+        if cap >= LIMIT_KEEP_TURN_V:
+            w = w * cap / abs(v)
+        v = math.copysign(cap, v)
+    if w > 0:
+        w = min(w, lim['w_left'])
+    elif w < 0:
+        w = max(w, -lim['w_right'])
+    return v, w
 
 
 def deflected(msg, dz_lin, dz_ang):
@@ -146,6 +213,16 @@ class Mux(object):
             rospy.logwarn('cmd_vel_mux: hold restored after restart: %s', sorted(self.holds))
         self.pub_held = rospy.Publisher('~held', Bool, queue_size=1, latch=True)
         rospy.Subscriber('~hold', String, self._hold, queue_size=20)
+
+        # Before the inputs as well: a mux restarted under rules starts stale.
+        self.limit = {'stale_start': True} if rospy.get_param('~limit_engaged', False) else None
+        self.limit_t = None              # monotonic of the last limit received
+        self.limit_warn_t = None
+        self.limit_stale_said = False
+        self.limit_said_t = None
+        self.pub_warn = rospy.Publisher('/map_rules/warning', String, queue_size=5)
+        self.pub_log = rospy.Publisher('/nextion/log_info', String, queue_size=10, latch=True)
+        rospy.Subscriber('~limit', String, self._limit, queue_size=5)
 
         self.human_last_deflect = {}     # name -> monotonic of the last deflected msg
         self.takeover_active = False
@@ -243,6 +320,74 @@ class Mux(object):
                         'orphaned': age is None or age > self.hold_keepalive_s}
         return out
 
+    # -- limit --------------------------------------------------------------
+    def _limit(self, msg):
+        try:
+            lim = parse_limit(msg.data)
+        except ValueError as exc:
+            rospy.logerr('cmd_vel_mux: bad limit %r: %s', msg.data, exc)
+            return
+        now = self.clock()
+        with self.lock:
+            changed = (lim is None) != (self.limit is None)
+            self.limit = lim
+            self.limit_t = now
+        if changed:
+            self._save_limit_engaged(lim is not None)
+            self._publish_status(force=True)
+
+    def _save_limit_engaged(self, engaged):
+        try:
+            if engaged:
+                rospy.set_param('~limit_engaged', True)
+            elif rospy.has_param('~limit_engaged'):
+                rospy.delete_param('~limit_engaged')
+        except Exception as exc:  # noqa: BLE001 - the in-memory limit still stands
+            rospy.logerr('cmd_vel_mux: could not save the limit flag: %s', exc)
+
+    def _limit_stale(self, now):
+        return self.limit_t is None or now - self.limit_t > LIMIT_STALE_S
+
+    def _limit_frozen(self):
+        return str((self.limit or {}).get('reason', '')).split(':')[0] in LIMIT_FROZEN
+
+    def _limit_watch(self, now):
+        """True when the stale state changed: say it, status at once."""
+        stale = self.limit is not None and (self._limit_stale(now) or self._limit_frozen())
+        changed = stale != self.limit_stale_said
+        self.limit_stale_said = stale
+        if stale and (changed or now - self.limit_said_t >= LIMIT_REPEAT_S):
+            self.limit_said_t = now
+            text = 'Map rules stop all motion: robot stopped.'
+            self.pub_warn.publish(String(json.dumps({'type': 'limit', 'name': '', 'text': text})))
+            self.pub_log.publish(String(text))
+        return changed
+
+    def _limited(self, msg, now):
+        """What goes out for the software message `msg`."""
+        lim = self.limit
+        if lim is None:
+            return msg
+        if self._limit_stale(now):
+            if self.limit_warn_t is None or now - self.limit_warn_t >= LIMIT_WARN_S:
+                self.limit_warn_t = now
+                rospy.logwarn('cmd_vel_mux: map rules limit is stale: software output is zero')
+            return Twist()
+        v, w = clamp_cmd(msg.linear.x, msg.angular.z, lim)
+        if v == msg.linear.x and w == msg.angular.z:
+            return msg
+        out = Twist()
+        out.linear.x, out.angular.z = v, w
+        return out
+
+    def _limit_status(self, now):
+        lim = self.limit
+        if lim is None:
+            return None
+        if self._limit_stale(now):
+            return {'stale': True, 'v_fwd': 0.0, 'v_back': 0.0, 'w': 0.0}
+        return dict(lim, stale=self._limit_frozen())
+
     # -- decisions ----------------------------------------------------------
     def _human_owner(self, now):
         """The highest-priority human input deflected within hold_s, or None."""
@@ -326,7 +471,8 @@ class Mux(object):
                         self.nav_blocked_now[caller] = now
             if forward:
                 self.last_forwarded = inp['name']
-                self.out.publish(msg)       # under the lock: a hold cannot slip in between
+                # under the lock: a hold cannot slip in between
+                self.out.publish(msg if inp.get('human') else self._limited(msg, now))
 
     def _ds4_status(self, msg):
         now = self.clock()
@@ -397,7 +543,8 @@ class Mux(object):
             self._update_rearm(now)
             if self.holds and self._human_owner(now) is None:
                 self.out.publish(Twist())
-        self._publish_status()
+            changed = self._limit_watch(now)
+        self._publish_status(force=changed)
 
     def _publish_status(self, force=False):
         now = self.clock()
@@ -411,6 +558,7 @@ class Mux(object):
                   'last_takeover': self.last_takeover, 'hold_s': self.hold_s,
                   'rearm_quiet_s': self.rearm_quiet_s,
                   'held': bool(self.holds), 'holds': self._hold_status(now),
+                  'limit': self._limit_status(now),
                   'hold_blocked_age': (None if self.hold_blocked_last is None
                                        else round(now - self.hold_blocked_last, 1))}
             held = bool(self.holds)

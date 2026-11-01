@@ -36,7 +36,9 @@ moves): human takeover (/cmd_vel_mux/active ds4|teleop, /cmd_vel_mux/takeover),
 a mux hold (/cmd_vel_mux/active hold: the motion is over, nobody resumes it),
 stop, keepalive lost, supervisor not RUNNING/stale (when required), drive
 motors off (/base/motor_power_state False), stale odometry (> ~odom_timeout),
-stale or missing lidar (> ~scan_timeout), obstacle in the direction of travel
+stale or missing lidar (> ~scan_timeout), a straight line that crosses a map
+nogo (checked once, at the start only: REJECTED, see _nogo_refusal; running
+motions are limited by cmd_vel_mux), obstacle in the direction of travel
 (corridor of the footprint width + ~side_margin, out to ~stop_distance plus
 the braking distance v^2/2a; for rotation any point inside the circumscribed
 circle + ~rotate_clearance), no progress (~stuck_s), timeout.
@@ -62,13 +64,53 @@ DEFAULTS = {
     'footprint_front': 0.238, 'footprint_rear': 0.288, 'footprint_half_width': 0.256,
     'odom_timeout': 0.5, 'scan_timeout': 0.5, 'supervisor_max_age': 1.0,
     'stuck_s': 3.0, 'pos_tolerance': 0.02, 'angle_tolerance_deg': 2.0,
-    'heading_gain': 1.5, 'rate_hz': 20.0,
+    'heading_gain': 1.5, 'rate_hz': 20.0, 'nogo_margin': 0.15,
     'min_linear': 0.03, 'min_angular': 0.08,
 }
 
 
 def wrap(a):
     return math.atan2(math.sin(a), math.cos(a))
+
+
+# ---- nogo geometry (no shapely here: this node must start on any install) ----
+def _segments(poly):
+    return zip(poly, poly[1:] + poly[:1])
+
+
+def _cross(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _intersect(p1, p2, q1, q2):
+    d1, d2 = _cross(q1, q2, p1), _cross(q1, q2, p2)
+    d3, d4 = _cross(p1, p2, q1), _cross(p1, p2, q2)
+    return d1 * d2 <= 0 and d3 * d4 <= 0 and not (d1 == d2 == 0)
+
+
+def _inside(pt, poly):
+    x, y = pt
+    hit = False
+    for (x1, y1), (x2, y2) in _segments(poly):
+        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+            hit = not hit
+    return hit
+
+
+def polygons_overlap(a, b):
+    if any(_intersect(p1, p2, q1, q2) for p1, p2 in _segments(a) for q1, q2 in _segments(b)):
+        return True
+    return _inside(a[0], b) or _inside(b[0], a)
+
+
+def body_box(x, y, yaw, p, ahead=0.0):
+    """The robot's box in the map, stretched `ahead` metres (+front / -rear)."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    front = p['footprint_front'] + max(ahead, 0.0)
+    rear = p['footprint_rear'] - min(ahead, 0.0)
+    half = p['footprint_half_width']
+    return [(x + c * lx - s * ly, y + s * lx + c * ly)
+            for lx, ly in ((front, half), (-rear, half), (-rear, -half), (front, -half))]
 
 
 class Rejected(ValueError):
@@ -93,6 +135,10 @@ class Driver(object):
         self.mux_active = None
         self.supervisor = None    # (t, state)
         self.cmd = None
+        self.site_nogos = []      # [(name, [(x, y)])] map frame, /map_objects/rules
+        self.rules_site = None
+        self.served_site = None   # /mapping_manager/status, None = not known
+        self.map_pose = None      # (t, x, y, yaw) map->base_link, read for a command
         self.status = {'id': None, 'state': 'IDLE', 'reason': None, 'kind': None,
                        'target': None, 'done_m': None, 'done_deg': None,
                        'elapsed_s': None, 'clearance_m': None}
@@ -133,6 +179,48 @@ class Driver(object):
         with self.lock:
             if flag and self.cmd:
                 self._end('ABORTED', 'stop')
+
+    def on_rules(self, raw):
+        """/map_objects/rules JSON.  A bad message, or site null (mapping_manager
+        away for a moment), keeps the last good one."""
+        try:
+            msg = json.loads(raw)
+            site = msg.get('site')
+            nogos = [(str(r.get('name', '')), [(float(x), float(y)) for x, y in r['points']])
+                     for r in msg['rules'] if r.get('type') == 'nogo']
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            self.warn('bad /map_objects/rules: %s' % exc)
+            return
+        if site is None:
+            return
+        with self.lock:
+            self.rules_site = site
+            self.site_nogos = [n for n in nogos if len(n[1]) >= 3]
+
+    def on_status(self, raw):
+        """/mapping_manager/status JSON: which site is served."""
+        try:
+            serving = json.loads(raw).get('serving')
+        except (ValueError, TypeError, AttributeError):
+            return
+        with self.lock:
+            self.served_site = serving.get('site') if isinstance(serving, dict) else None
+
+    @property
+    def nogos(self):
+        """The nogos that apply: another site's rules are in another map."""
+        if self.served_site is not None and self.rules_site != self.served_site:
+            return []
+        return self.site_nogos
+
+    def on_map_pose(self, x, y, yaw):
+        with self.lock:
+            self.map_pose = (self.clock(), float(x), float(y), float(yaw))
+
+    def wants_map_pose(self):
+        """With no nogo the command path has nothing to look up."""
+        with self.lock:
+            return bool(self.nogos)
 
     def on_keepalive(self, cid):
         with self.lock:
@@ -232,7 +320,7 @@ class Driver(object):
             cmd['progress_t'] = now
             cmd['progress_val'] = 0.0
             self.cmd = cmd
-            why = self._guards(now, start=True)
+            why = self._guards(now, start=True) or self._nogo_refusal(cmd, now)
             if why is None and self.odom is not None:
                 _t, x, y, yaw = self.odom
                 cmd['start'] = (x, y, yaw)
@@ -373,6 +461,48 @@ class Driver(object):
         why, clear = self._obstacle(cmd)
         self.status['clearance_m'] = None if clear is None else round(clear, 2)
         return why
+
+    def _nogo_refusal(self, cmd, now):
+        """A reason when the way of `cmd` takes the body into a nogo or within
+        ~nogo_margin of it, where cmd_vel_mux would stop it short of the target.
+
+        A robot already touching a nogo may always move: which way leads out is
+        cmd_vel_mux's business, and a 2 m motion may not reach the edge.  A
+        rotation has no way, the mux limits it.
+        """
+        nogos = self.nogos
+        if not nogos or cmd['kind'] == 'rotate':
+            return None
+        pose = self.map_pose
+        if pose is None or now - pose[0] > self.p['odom_timeout']:
+            return 'nogo check: no map pose'
+        _t, x, y, yaw = pose
+        here = body_box(x, y, yaw, self.p)
+        if any(polygons_overlap(here, poly) for _name, poly in nogos):
+            return None
+        boxes = self._way(cmd, x, y, yaw)
+        for name, poly in nogos:
+            if any(polygons_overlap(box, poly) for box in boxes):
+                return 'target crosses nogo %s' % name
+        return None
+
+    def _way(self, cmd, x, y, yaw):
+        """The body boxes along a command, the margin ahead at the end."""
+        margin = self.p['nogo_margin']
+        turn = cmd.get('w', 0.0) if cmd['kind'] == 'velocity' else 0.0
+        if not turn:
+            dist = cmd['target'] if cmd['kind'] == 'straight' else cmd['v'] * cmd['target']
+            return [body_box(x, y, yaw, self.p, ahead=dist + math.copysign(margin, dist))]
+        boxes = []
+        step = 0.1
+        for _ in range(int(math.ceil(cmd['target'] / step))):
+            yaw += turn * step
+            x += cmd['v'] * step * math.cos(yaw)
+            y += cmd['v'] * step * math.sin(yaw)
+            boxes.append(body_box(x, y, yaw, self.p))
+        boxes.append(body_box(x, y, yaw, self.p,
+                              ahead=math.copysign(margin, cmd['v'] or 1.0)))
+        return boxes
 
     def _obstacle(self, cmd):
         """(reason or None, clearance in the direction of travel)."""
@@ -560,7 +690,24 @@ def main():
     rospy.Subscriber('/drive_primitive/keepalive', String, lambda m: drv.on_keepalive(m.data),
                      queue_size=20)
 
+    rospy.Subscriber('/map_objects/rules', String, lambda m: drv.on_rules(m.data), queue_size=1)
+    rospy.Subscriber('/mapping_manager/status', String, lambda m: drv.on_status(m.data),
+                     queue_size=1)
+
+    def map_pose():
+        try:
+            tr = buf.lookup_transform('map', base_frame, rospy.Time(0), rospy.Duration(0.1))
+        except Exception as exc:  # noqa: BLE001 - a missing pose refuses the command
+            rospy.logwarn_throttle(30.0, 'drive_primitive: no map pose: %s' % exc)
+            return
+        if (rospy.Time.now() - tr.header.stamp).to_sec() > 1.0:
+            return                     # an old transform is no pose
+        t = tr.transform
+        drv.on_map_pose(t.translation.x, t.translation.y, yaw_of(t.rotation))
+
     def command_cb(msg):
+        if drv.wants_map_pose():
+            map_pose()
         st = drv.command(msg.data)
         rospy.loginfo('drive_primitive: %s %s %s', st.get('id'), st.get('state'),
                       st.get('reason') or '')
